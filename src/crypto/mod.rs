@@ -7,11 +7,16 @@
 //! same primitives via BouncyCastle, so the wire format is interoperable.
 
 pub mod ed25519;
+pub mod keys;
 pub mod x25519_box;
 
 #[allow(unused_imports)]
 pub use ed25519::{
     generate_ed25519, Ed25519Error, Ed25519PrivateKey, Ed25519PublicKey, Ed25519Signature,
+};
+#[allow(unused_imports)]
+pub use keys::{
+    load_ed25519_priv, load_x25519_priv, save_ed25519_priv, save_x25519_priv, KeyIoError,
 };
 #[allow(unused_imports)]
 pub use x25519_box::{
