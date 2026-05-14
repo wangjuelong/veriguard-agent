@@ -43,6 +43,15 @@ use crate::transport::poll::TaskResult;
 
 use super::pipe::{new_temp_pipe, NamedPipe};
 
+/// Default hard upper bound on implant binary downloads (50 MiB).  Any
+/// platform response declaring a larger `Content-Length`, or whose body
+/// exceeds this after read, is rejected — defends the agent against
+/// multi-GB OOM attacks from a malicious / misconfigured platform.
+///
+/// Tests may set [`ImplantManager::max_binary_bytes`] to a smaller value to
+/// trigger the cap deterministically.
+pub const DEFAULT_MAX_IMPLANT_BINARY_BYTES: u64 = 50 * 1024 * 1024;
+
 /// Errors raised while running a veriguard-implant subprocess.
 #[derive(Debug, Error)]
 pub enum ImplantError {
@@ -89,6 +98,11 @@ pub struct ImplantManager {
     /// Parent dir under which to create the temp result pipe.  Defaults to
     /// `state_dir/pipes` when constructed via [`ImplantManager::new`].
     pub pipe_parent: PathBuf,
+    /// Hard cap on the implant binary download size, in bytes.  Defaults to
+    /// [`DEFAULT_MAX_IMPLANT_BINARY_BYTES`] (50 MiB).  Tests override this
+    /// to a small value so the size-cap branch is reachable without
+    /// actually serving multi-megabyte responses.
+    pub max_binary_bytes: u64,
 }
 
 impl ImplantManager {
@@ -106,6 +120,7 @@ impl ImplantManager {
             arch: detect_arch(),
             implant_path_override: None,
             pipe_parent,
+            max_binary_bytes: DEFAULT_MAX_IMPLANT_BINARY_BYTES,
         }
     }
 
@@ -226,9 +241,33 @@ impl ImplantManager {
             })?
             .to_ascii_lowercase();
 
+        // Size cap: refuse multi-GB responses (malicious / misconfigured
+        // platform) that could OOM the agent before we even hash them.
+        let max = self.max_binary_bytes;
+        if let Some(len) = resp.content_length() {
+            if len > max {
+                return Err(ImplantError::Download {
+                    message: format!(
+                        "implant binary download too large: {len} bytes (max {max} bytes)"
+                    ),
+                });
+            }
+        }
+
         let body = resp.bytes().map_err(|e| ImplantError::Download {
             message: format!("body read failed: {e}"),
         })?;
+
+        // Defense in depth: if Content-Length was missing or under-stated,
+        // verify the actual bytes we just read still fit the cap.
+        if body.len() as u64 > max {
+            return Err(ImplantError::Download {
+                message: format!(
+                    "implant binary actual size {} exceeds {max} bytes",
+                    body.len()
+                ),
+            });
+        }
 
         let actual_sha = hex_encode(&Sha256::digest(&body));
         if actual_sha != expected_sha {
@@ -534,10 +573,58 @@ exit 0
             arch: "x86_64".to_string(),
             implant_path_override: None,
             pipe_parent: dir.path().join("pipes"),
+            max_binary_bytes: DEFAULT_MAX_IMPLANT_BINARY_BYTES,
         };
         let err = m.ensure_implant_binary().expect_err("404");
         match err {
             ImplantError::Download { message } => assert!(message.contains("404"), "{message}"),
+            other => panic!("expected Download err, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ensure_implant_binary_rejects_oversize_content_length() {
+        // Platform serves a 4 KiB body; the manager is configured with a
+        // 1 KiB cap so both the Content-Length check (mockito auto-sets it
+        // to actual body size) and the body-length check reject it.  This
+        // pins the size-cap branch without needing to actually serve 50+
+        // MiB through the test loopback.
+        let mut server = mockito::Server::new();
+        let body = vec![b'A'; 4 * 1024];
+        let sha = hex_encode(&Sha256::digest(&body));
+        server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/agent/implant/download/.*".to_string()),
+            )
+            .with_status(200)
+            .with_header("X-SHA256", &sha)
+            .with_body(body.as_slice())
+            .create();
+
+        let dir = tempdir().unwrap();
+        let m = ImplantManager {
+            platform_url: server.url(),
+            state_dir: dir.path().to_path_buf(),
+            http_client: reqwest::blocking::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            implant_path_override: None,
+            pipe_parent: dir.path().join("pipes"),
+            max_binary_bytes: 1024, // 1 KiB — much smaller than the served 4 KiB body.
+        };
+        let err = m.ensure_implant_binary().expect_err("oversize must error");
+        match err {
+            ImplantError::Download { message } => {
+                assert!(
+                    message.contains("too large") || message.contains("exceeds"),
+                    "{message}"
+                );
+            }
             other => panic!("expected Download err, got {other:?}"),
         }
     }
@@ -570,6 +657,7 @@ exit 0
             arch: "x86_64".to_string(),
             implant_path_override: None,
             pipe_parent: dir.path().join("pipes"),
+            max_binary_bytes: DEFAULT_MAX_IMPLANT_BINARY_BYTES,
         };
         let err = m.ensure_implant_binary().expect_err("sha mismatch");
         match err {
@@ -655,6 +743,7 @@ exit 0
             arch: "x86_64".to_string(),
             implant_path_override: None,
             pipe_parent: dir.path().join("pipes"),
+            max_binary_bytes: DEFAULT_MAX_IMPLANT_BINARY_BYTES,
         };
         let path = m.ensure_implant_binary().expect("ok");
         assert!(path.exists());
