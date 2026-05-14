@@ -63,6 +63,14 @@ pub enum BoxError {
 pub const NONCE_BYTES: usize = 12;
 
 /// X25519 private scalar (32 bytes).  Wraps `StaticSecret`.
+///
+/// Do NOT add `#[derive(Debug)]` or any custom `Debug` / `Display` impl —
+/// `StaticSecret` omits `Debug` deliberately so a stray
+/// `format!("{:?}", key)` cannot leak the 32-byte scalar through a log line.
+/// Any wrapper that prints `self.inner.to_bytes()` (or transitively does so
+/// via a derived `Debug` of an enclosing struct) silently exfiltrates the
+/// secret.  If you need a stable identifier for a key, derive a
+/// fingerprint from the **public** half (`self.public_key().to_bytes()`).
 pub struct X25519PrivateKey {
     inner: StaticSecret,
 }

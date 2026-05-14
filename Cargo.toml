@@ -20,7 +20,7 @@ rolling-file = "0.2.0"
 
 # Veriguard 二开 (C1-Agent-1): 非对称密码学 + Mode C 离线包 + onboarding
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
-x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+x25519-dalek = { version = "2.0", features = ["static_secrets", "zeroize"] }
 chacha20poly1305 = "0.10"
 rand_core = { version = "0.6", features = ["std"] }
 rusqlite = { version = "0.36", features = ["bundled"] }
@@ -29,6 +29,10 @@ sha2 = "0.10"
 base64 = "0.22"
 dirs = "5"
 clap = { version = "4.5", features = ["derive"] }
+
+[target.'cfg(unix)'.dependencies]
+# Veriguard 二开 (C1-Agent-2): mkfifo for implant result pipe
+nix = { version = "0.29", features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8.0"

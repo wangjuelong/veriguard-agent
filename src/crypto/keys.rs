@@ -91,6 +91,37 @@ pub fn load_x25519_priv(path: &Path) -> Result<X25519PrivateKey, KeyIoError> {
     Ok(X25519PrivateKey::from_bytes(&bytes))
 }
 
+/// RAII guard that removes a file on drop unless [`Self::disarm`] has been
+/// called.  Used by [`save_raw`] so that any error between `OpenOptions::open`
+/// and the successful `fs::rename` leaves no half-written tmp key file on
+/// disk (which would either confuse a subsequent retry or, worse, persist
+/// half of a secret in a world-readable cache).
+struct TmpFileGuard {
+    path: Option<PathBuf>,
+}
+
+impl TmpFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    /// Cancel cleanup — call after the tmp file has been successfully
+    /// renamed into its final location.
+    fn disarm(mut self) {
+        self.path.take();
+    }
+}
+
+impl Drop for TmpFileGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.path.take() {
+            // Best-effort cleanup; we never want a cleanup failure to mask
+            // the real error that triggered the drop.
+            let _ = fs::remove_file(&p);
+        }
+    }
+}
+
 fn save_raw(path: &Path, bytes: &[u8; PRIVATE_KEY_LEN]) -> Result<(), KeyIoError> {
     let tmp_path = tmp_path_for(path);
 
@@ -102,28 +133,33 @@ fn save_raw(path: &Path, bytes: &[u8; PRIVATE_KEY_LEN]) -> Result<(), KeyIoError
         })?;
     }
 
-    // Write to tmp file, then rename into place.
+    // Open the tmp file *first* and arm the cleanup guard immediately so any
+    // subsequent error (write / sync / permission / rename) leaves no
+    // residual tmp file on disk.
+    let mut opts = OpenOptions::new();
+    opts.create(true).truncate(true).write(true);
+    #[cfg(unix)]
     {
-        let mut opts = OpenOptions::new();
-        opts.create(true).truncate(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut file = opts.open(&tmp_path).map_err(|source| KeyIoError::Io {
-            path: tmp_path.clone(),
-            source,
-        })?;
-        file.write_all(bytes).map_err(|source| KeyIoError::Io {
-            path: tmp_path.clone(),
-            source,
-        })?;
-        file.sync_all().map_err(|source| KeyIoError::Io {
-            path: tmp_path.clone(),
-            source,
-        })?;
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
     }
+    let mut file = opts.open(&tmp_path).map_err(|source| KeyIoError::Io {
+        path: tmp_path.clone(),
+        source,
+    })?;
+
+    // From here on, on any early-return the `guard` deletes `tmp_path`.
+    let guard = TmpFileGuard::new(tmp_path.clone());
+
+    file.write_all(bytes).map_err(|source| KeyIoError::Io {
+        path: tmp_path.clone(),
+        source,
+    })?;
+    file.sync_all().map_err(|source| KeyIoError::Io {
+        path: tmp_path.clone(),
+        source,
+    })?;
+    drop(file);
 
     #[cfg(unix)]
     {
@@ -140,6 +176,10 @@ fn save_raw(path: &Path, bytes: &[u8; PRIVATE_KEY_LEN]) -> Result<(), KeyIoError
         path: path.to_path_buf(),
         source,
     })?;
+
+    // Successful rename — disarm the guard so its Drop does NOT delete the
+    // file we just moved into place.
+    guard.disarm();
 
     Ok(())
 }
@@ -280,5 +320,84 @@ mod tests {
 
         save_ed25519_priv(&path, &generate_ed25519()).expect("save creates parents");
         assert!(path.exists());
+    }
+
+    #[test]
+    fn test_tmp_file_guard_removes_file_on_drop_when_armed() {
+        // White-box test that the RAII guard cleans up the tmp file when
+        // its owner returns early without disarming.  We construct a guard
+        // directly because exercising the "rename fails" branch
+        // deterministically across platforms is brittle.
+        let dir = tempdir().unwrap();
+        let tmp = dir.path().join("dangling.tmp");
+        std::fs::write(&tmp, b"sensitive").unwrap();
+        assert!(tmp.exists(), "fixture must be present");
+
+        {
+            let _g = TmpFileGuard::new(tmp.clone());
+            // No `g.disarm()` — simulate an early-return from save_raw.
+        }
+        assert!(
+            !tmp.exists(),
+            "armed guard must delete the tmp file when dropped"
+        );
+    }
+
+    #[test]
+    fn test_tmp_file_guard_keeps_file_when_disarmed() {
+        let dir = tempdir().unwrap();
+        let tmp = dir.path().join("dangling.tmp");
+        std::fs::write(&tmp, b"sensitive").unwrap();
+
+        let g = TmpFileGuard::new(tmp.clone());
+        g.disarm();
+        assert!(
+            tmp.exists(),
+            "disarmed guard must NOT delete the tmp file (Drop is a no-op)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_save_rename_failure_cleans_up_tmp_file() {
+        // Simulate a rename failure: make the parent directory read-only
+        // AFTER the tmp file is written.  The rename should fail because we
+        // cannot create the destination dentry inside a read-only dir.
+        //
+        // POSIX gives us no clean "rename fails" injection so we approximate
+        // with a directory chmod 0500 (read+exec only).  This works on
+        // tmpfs / ext4 / APFS used by `tempdir()`.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let restricted = dir.path().join("ro_parent");
+        std::fs::create_dir(&restricted).unwrap();
+        let path = restricted.join("key.bin");
+
+        // Make the dir read-only, so the eventual `fs::rename` cannot land
+        // a new dentry inside it.  We still need write to allow the
+        // OpenOptions::open(tmp_path) line; the test order matters here
+        // because save_raw opens the tmp INSIDE the same dir as `path`.
+        //
+        // To exercise the cleanup branch we need the tmp file write to
+        // succeed but the rename to fail.  Easiest cross-FS trick: pre-
+        // create `path` as a directory, so `fs::rename(tmp, dir)` returns
+        // EISDIR / EEXIST.
+        std::fs::create_dir(&path).unwrap();
+
+        let err = save_ed25519_priv(&path, &generate_ed25519()).expect_err("rename must fail");
+        match err {
+            KeyIoError::Io { .. } => {}
+            other => panic!("expected Io variant, got {other:?}"),
+        }
+        let tmp = tmp_path_for(&path);
+        assert!(
+            !tmp.exists(),
+            "tmp file {tmp:?} must be cleaned up when rename fails"
+        );
+        // The pre-existing directory at `path` must still be there (we did
+        // not touch it on the failure path).
+        assert!(path.is_dir(), "pre-existing dentry preserved");
+        // Reset perms so tempdir teardown succeeds.
+        std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 }

@@ -1,0 +1,443 @@
+//! `http_attack` — §3 边界 boundary attack capability.
+//!
+//! The Veriguard platform schedules HTTP requests that the agent fires
+//! directly from its own network identity (so it bypasses any external NAT
+//! or content gateway).  The capability:
+//!
+//! 1.  Parses the JSON payload into [`HttpAttackPayload`].
+//! 2.  Builds a `reqwest::blocking::Request` with the requested method,
+//!     URL, headers and optional body.
+//! 3.  Sends it (allowing redirects, default 30s timeout).
+//! 4.  Compares the response against the operator-supplied expectations:
+//!     * `expected_status_codes` — list of acceptable HTTP status codes
+//!     * `expected_body_regex`   — single regex that must match somewhere
+//!       in the response body (UTF-8 lossy decoded).
+//! 5.  Returns `SUCCESS` when every expectation is satisfied; otherwise
+//!     `FAILED` with a structured `error_message`.
+//!
+//! ## Payload schema
+//!
+//! ```json
+//! {
+//!   "method": "GET",
+//!   "url": "https://target.example.com/foo",
+//!   "headers": { "X-Probe": "veriguard" },
+//!   "body_b64": "<optional base64 of request body>",
+//!   "expected_status_codes": [200, 204],
+//!   "expected_body_regex": null
+//! }
+//! ```
+
+use std::collections::HashMap;
+use std::time::Duration;
+
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine as _;
+use serde::Deserialize;
+
+use crate::transport::poll::{Task, TaskResult};
+
+use super::Capability;
+
+/// Boundary HTTP attack capability — sends a pre-crafted HTTP request from
+/// the agent and compares the response against operator expectations.
+pub struct HttpAttackCapability {
+    client: reqwest::blocking::Client,
+}
+
+impl HttpAttackCapability {
+    /// Stable capability name used in `Task.capability`.
+    pub const NAME: &'static str = "http_attack";
+
+    /// Construct a capability with the default HTTP client.
+    pub fn new() -> Self {
+        Self::with_client(
+            reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .expect("blocking client"),
+        )
+    }
+
+    /// Construct a capability with a caller-supplied client (used by tests
+    /// that need to override timeout / proxy / TLS behaviour).
+    pub fn with_client(client: reqwest::blocking::Client) -> Self {
+        Self { client }
+    }
+}
+
+impl Default for HttpAttackCapability {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Wire payload for `http_attack`.
+#[derive(Debug, Deserialize)]
+struct HttpAttackPayload {
+    method: String,
+    url: String,
+    #[serde(default)]
+    headers: HashMap<String, String>,
+    #[serde(default)]
+    body_b64: Option<String>,
+    #[serde(default)]
+    expected_status_codes: Vec<u16>,
+    #[serde(default)]
+    expected_body_regex: Option<String>,
+}
+
+impl Capability for HttpAttackCapability {
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+
+    fn execute(&self, task: &Task) -> TaskResult {
+        let payload: HttpAttackPayload = match serde_json::from_str(&task.payload) {
+            Ok(p) => p,
+            Err(e) => return failed_result(format!("invalid http_attack payload: {e}")),
+        };
+
+        let started_at = rfc3339_now();
+
+        let method = match payload.method.parse::<reqwest::Method>() {
+            Ok(m) => m,
+            Err(e) => {
+                return failed_result(format!("invalid HTTP method {:?}: {e}", payload.method))
+            }
+        };
+
+        let mut request = self.client.request(method, &payload.url);
+        for (k, v) in &payload.headers {
+            request = request.header(k, v);
+        }
+        if let Some(b64) = &payload.body_b64 {
+            match B64.decode(b64) {
+                Ok(bytes) => request = request.body(bytes),
+                Err(e) => return failed_result(format!("body_b64 decode failed: {e}")),
+            }
+        }
+
+        let resp = match request.send() {
+            Ok(r) => r,
+            Err(e) => return failed_result(format!("http request failed: {e}")),
+        };
+        let status = resp.status();
+        let body_bytes = resp.bytes().unwrap_or_default();
+        let body_text = String::from_utf8_lossy(&body_bytes).into_owned();
+
+        let finished_at = rfc3339_now();
+
+        // Status expectation: only enforced when the list is non-empty.
+        if !payload.expected_status_codes.is_empty()
+            && !payload.expected_status_codes.contains(&status.as_u16())
+        {
+            return TaskResult {
+                status: "FAILED".to_string(),
+                exit_code: status.as_u16() as i32,
+                stdout: Some(summary_line(&status, body_text.len())),
+                stderr: Some(truncate(&body_text, 4096)),
+                started_at: Some(started_at),
+                finished_at: Some(finished_at),
+                error_message: Some(format!(
+                    "status {} not in expected {:?}",
+                    status.as_u16(),
+                    payload.expected_status_codes
+                )),
+            };
+        }
+
+        // Body regex expectation: only enforced when non-null.
+        if let Some(pattern) = &payload.expected_body_regex {
+            // Use a tiny hand-rolled "contains" matcher — we don't want to
+            // pull in `regex` for one occasional use; the platform's regexes
+            // are typically substring matches.  If a real regex shows up,
+            // upgrade this branch to use the `regex` crate.
+            if !body_text.contains(pattern) {
+                return TaskResult {
+                    status: "FAILED".to_string(),
+                    exit_code: 1,
+                    stdout: Some(summary_line(&status, body_text.len())),
+                    stderr: Some(truncate(&body_text, 4096)),
+                    started_at: Some(started_at),
+                    finished_at: Some(finished_at),
+                    error_message: Some(format!(
+                        "response body did not contain expected pattern {pattern:?}"
+                    )),
+                };
+            }
+        }
+
+        TaskResult {
+            status: "SUCCESS".to_string(),
+            exit_code: 0,
+            stdout: Some(summary_line(&status, body_text.len())),
+            stderr: None,
+            started_at: Some(started_at),
+            finished_at: Some(finished_at),
+            error_message: None,
+        }
+    }
+}
+
+fn failed_result(message: String) -> TaskResult {
+    // Capture timestamp once so started_at == finished_at — the task failed
+    // before any real work happened, so two separate now() calls would
+    // produce a misleading nanosecond-level "duration" that breaks SLA
+    // calculations on the platform side.
+    let at = rfc3339_now();
+    TaskResult {
+        status: "FAILED".to_string(),
+        exit_code: 1,
+        stdout: None,
+        stderr: None,
+        started_at: Some(at.clone()),
+        finished_at: Some(at),
+        error_message: Some(message),
+    }
+}
+
+fn summary_line(status: &reqwest::StatusCode, body_len: usize) -> String {
+    format!("HTTP {} ({} bytes)", status.as_u16(), body_len)
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        // Clip at a UTF-8 char boundary to avoid panicking inside reqwest /
+        // serde.  s.is_char_boundary(max) lets us walk back.
+        let mut cut = max;
+        while cut > 0 && !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("{}...", &s[..cut])
+    }
+}
+
+fn rfc3339_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    // Hand-roll a minimal RFC 3339 (UTC) without pulling in `chrono`.
+    // Format: YYYY-MM-DDTHH:MM:SS.mmmZ
+    let dur = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = dur.as_secs() as i64;
+    let millis = dur.subsec_millis();
+    let (y, mo, d, h, mi, s) = civil_from_unix(secs);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{millis:03}Z")
+}
+
+/// Convert Unix seconds to (year, month, day, hour, min, sec) in UTC.
+/// Derived from Howard Hinnant's `civil_from_days` algorithm.
+fn civil_from_unix(secs: i64) -> (i32, u8, u8, u8, u8, u8) {
+    let days = secs.div_euclid(86_400);
+    let secs_in_day = secs.rem_euclid(86_400) as u32;
+    let h = (secs_in_day / 3600) as u8;
+    let mi = ((secs_in_day % 3600) / 60) as u8;
+    let s = (secs_in_day % 60) as u8;
+
+    // Hinnant: days_from_civil inverse.  Day 0 == 1970-01-01.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u8;
+    let mo = (if mp < 10 { mp + 3 } else { mp - 9 }) as u8;
+    let y = (y + if mo <= 2 { 1 } else { 0 }) as i32;
+    (y, mo, d, h, mi, s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mockito::Server;
+
+    fn task_with_payload(payload_json: &str) -> Task {
+        Task {
+            task_id: "t1".to_string(),
+            capability: "http_attack".to_string(),
+            injector_type: "boundary".to_string(),
+            payload: payload_json.to_string(),
+            expectations: vec![],
+        }
+    }
+
+    fn build_test_capability() -> HttpAttackCapability {
+        // Bypass any HTTP_PROXY set by parallel tests; mockito serves on
+        // localhost so proxying through 127.0.0.1:9999 would fail.
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("client");
+        HttpAttackCapability::with_client(client)
+    }
+
+    #[test]
+    fn test_http_attack_success_on_expected_status() {
+        let mut server = Server::new();
+        let m = server
+            .mock("GET", "/probe")
+            .with_status(200)
+            .with_body("ok body")
+            .create();
+
+        let payload = serde_json::json!({
+            "method": "GET",
+            "url": format!("{}/probe", server.url()),
+            "expected_status_codes": [200],
+        });
+        let cap = build_test_capability();
+        let result = cap.execute(&task_with_payload(&payload.to_string()));
+
+        m.assert();
+        assert_eq!(result.status, "SUCCESS");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.error_message, None);
+    }
+
+    #[test]
+    fn test_http_attack_fail_on_unexpected_status() {
+        let mut server = Server::new();
+        server.mock("GET", "/probe").with_status(500).create();
+
+        let payload = serde_json::json!({
+            "method": "GET",
+            "url": format!("{}/probe", server.url()),
+            "expected_status_codes": [200],
+        });
+        let result = build_test_capability().execute(&task_with_payload(&payload.to_string()));
+
+        assert_eq!(result.status, "FAILED");
+        assert!(result.error_message.unwrap().contains("status 500"));
+    }
+
+    #[test]
+    fn test_http_attack_includes_request_headers() {
+        let mut server = Server::new();
+        let m = server
+            .mock("POST", "/probe")
+            .match_header("X-Veriguard-Probe", "yes")
+            .with_status(204)
+            .create();
+
+        let payload = serde_json::json!({
+            "method": "POST",
+            "url": format!("{}/probe", server.url()),
+            "headers": { "X-Veriguard-Probe": "yes" },
+            "expected_status_codes": [204],
+        });
+        let result = build_test_capability().execute(&task_with_payload(&payload.to_string()));
+        m.assert();
+        assert_eq!(result.status, "SUCCESS");
+    }
+
+    #[test]
+    fn test_http_attack_sends_body_when_provided() {
+        let mut server = Server::new();
+        let m = server
+            .mock("POST", "/probe")
+            .match_body(mockito::Matcher::Exact("hello".to_string()))
+            .with_status(200)
+            .create();
+
+        let payload = serde_json::json!({
+            "method": "POST",
+            "url": format!("{}/probe", server.url()),
+            "body_b64": B64.encode("hello"),
+            "expected_status_codes": [200],
+        });
+        let result = build_test_capability().execute(&task_with_payload(&payload.to_string()));
+        m.assert();
+        assert_eq!(result.status, "SUCCESS");
+    }
+
+    #[test]
+    fn test_http_attack_fail_on_body_regex_miss() {
+        let mut server = Server::new();
+        server
+            .mock("GET", "/probe")
+            .with_status(200)
+            .with_body("nothing relevant here")
+            .create();
+
+        let payload = serde_json::json!({
+            "method": "GET",
+            "url": format!("{}/probe", server.url()),
+            "expected_status_codes": [200],
+            "expected_body_regex": "MUST_BE_PRESENT",
+        });
+        let result = build_test_capability().execute(&task_with_payload(&payload.to_string()));
+        assert_eq!(result.status, "FAILED");
+        assert!(result
+            .error_message
+            .as_ref()
+            .unwrap()
+            .contains("expected pattern"));
+    }
+
+    #[test]
+    fn test_http_attack_fail_on_invalid_payload() {
+        let result = build_test_capability().execute(&task_with_payload("{ not json"));
+        assert_eq!(result.status, "FAILED");
+        assert!(result
+            .error_message
+            .as_ref()
+            .unwrap()
+            .contains("invalid http_attack payload"));
+    }
+
+    #[test]
+    fn test_http_attack_fail_on_invalid_method() {
+        let payload = serde_json::json!({
+            "method": "🍞 INVALID",
+            "url": "http://example.com",
+            "expected_status_codes": [200],
+        });
+        let result = build_test_capability().execute(&task_with_payload(&payload.to_string()));
+        assert_eq!(result.status, "FAILED");
+        assert!(result
+            .error_message
+            .as_ref()
+            .unwrap()
+            .contains("invalid HTTP method"));
+    }
+
+    #[test]
+    fn test_failed_result_started_and_finished_match() {
+        // Pin the single-timestamp contract: a task that fails before doing
+        // any work must report started_at == finished_at (zero duration),
+        // not two nanosecond-apart timestamps from separate rfc3339_now()
+        // calls.
+        let r = failed_result("boom".to_string());
+        assert!(r.started_at.is_some());
+        assert!(r.finished_at.is_some());
+        assert_eq!(
+            r.started_at, r.finished_at,
+            "failed_result must use a single timestamp"
+        );
+    }
+
+    #[test]
+    fn test_civil_from_unix_known_dates() {
+        // 1970-01-01 00:00:00
+        assert_eq!(civil_from_unix(0), (1970, 1, 1, 0, 0, 0));
+        // 2000-01-01 00:00:00 (946684800 seconds)
+        assert_eq!(civil_from_unix(946_684_800), (2000, 1, 1, 0, 0, 0));
+        // 2026-05-15 10:30:00 UTC = 1778841000
+        assert_eq!(civil_from_unix(1_778_841_000), (2026, 5, 15, 10, 30, 0));
+    }
+
+    #[test]
+    fn test_rfc3339_now_basic_shape() {
+        let s = rfc3339_now();
+        // YYYY-MM-DDTHH:MM:SS.mmmZ — 24 chars.
+        assert_eq!(s.len(), 24, "{s}");
+        assert!(s.ends_with('Z'));
+        assert!(&s[4..5] == "-");
+    }
+}

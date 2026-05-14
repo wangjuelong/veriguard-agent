@@ -103,8 +103,30 @@ pub fn parse_install_pack(json: &str) -> Result<InstallPack, InstallPackError> {
     Ok(pack)
 }
 
+/// Maximum size of an `install-pack.json` we will accept on disk.
+///
+/// An install pack is a small JSON document (~1 KiB in production); anything
+/// larger is almost certainly a corrupt or malicious file. The cap is checked
+/// BEFORE `fs::read_to_string` so a pathological multi-MiB input cannot
+/// allocate memory on the agent.
+const INSTALL_PACK_MAX_BYTES: u64 = 64 * 1024;
+
 /// Read an [`InstallPack`] from disk and parse + validate it.
+///
+/// Rejects files larger than [`INSTALL_PACK_MAX_BYTES`] (64 KiB) with a
+/// structured I/O error before any allocation, so a malicious or corrupt
+/// file cannot exhaust agent memory.
 pub fn load_install_pack(path: &Path) -> Result<InstallPack, InstallPackError> {
+    let metadata = fs::metadata(path)?;
+    let len = metadata.len();
+    if len > INSTALL_PACK_MAX_BYTES {
+        return Err(InstallPackError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "install pack at {path:?} is too large: {len} bytes (max {INSTALL_PACK_MAX_BYTES})"
+            ),
+        )));
+    }
     let raw = fs::read_to_string(path)?;
     parse_install_pack(&raw)
 }
@@ -348,5 +370,27 @@ mod tests {
         json["schema_version"] = serde_json::json!("2.0");
         let err = parse_install_pack(&json.to_string()).expect_err("version");
         assert!(matches!(err, InstallPackError::UnsupportedSchemaVersion(_)));
+    }
+
+    #[test]
+    fn test_install_pack_rejects_oversized_file() {
+        // Write 100 KiB of whitespace (well over the 64 KiB cap) and confirm
+        // `load_install_pack` refuses to even read the file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.json");
+        let big = " ".repeat(100 * 1024);
+        std::fs::write(&path, big).unwrap();
+
+        let err = load_install_pack(&path).expect_err("oversized must fail");
+        match err {
+            InstallPackError::Io(io_err) => {
+                let msg = io_err.to_string();
+                assert!(
+                    msg.contains("too large"),
+                    "error must mention the cap: {msg}"
+                );
+            }
+            other => panic!("expected Io error, got {other:?}"),
+        }
     }
 }
