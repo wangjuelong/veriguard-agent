@@ -42,15 +42,45 @@ fn test_cli_init_without_subargs_fails() {
 }
 
 #[test]
-fn test_cli_init_bootstrap_not_yet_wired() {
-    // C1-Agent-2 implements Mode A bootstrap.  For now we expect a clear error.
+fn test_cli_init_bootstrap_until_platform_pubs_wired_fails_clearly() {
+    // C1-Agent-2 implements Mode A bootstrap (HTTP fetch of platform pubs).
+    // Until then the synthesised pack has empty platform pubs and validate()
+    // returns a structured error — confirm we exit non-zero with a clean
+    // failure (not a panic).
+    let state_dir = tempdir().unwrap();
+    let output = Command::cargo_bin("veriguard-agent")
+        .expect("binary builds")
+        .arg("init")
+        .arg("--bootstrap")
+        .arg("--platform-url")
+        .arg("https://veriguard.example.com")
+        .arg("--onboard-token")
+        .arg("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        .arg("--platform-cert-pin")
+        .arg("sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        .arg("--state-dir")
+        .arg(state_dir.path())
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("bootstrap") || stderr.contains("install pack"),
+        "stderr should mention bootstrap/install pack, got: {stderr}"
+    );
+}
+
+#[test]
+fn test_cli_init_bootstrap_rejects_http_url() {
     let state_dir = tempdir().unwrap();
     Command::cargo_bin("veriguard-agent")
         .expect("binary builds")
         .arg("init")
         .arg("--bootstrap")
         .arg("--platform-url")
-        .arg("https://veriguard.example.com")
+        .arg("http://insecure.example.com")
         .arg("--onboard-token")
         .arg("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
         .arg("--platform-cert-pin")

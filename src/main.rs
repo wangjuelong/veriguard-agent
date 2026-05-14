@@ -174,6 +174,10 @@ struct InitArgs {
     #[arg(long, requires = "bootstrap")]
     platform_cert_pin: Option<String>,
 
+    /// Optional with `--bootstrap`: agent label.  Defaults to `agent-bootstrap`.
+    #[arg(long, requires = "bootstrap")]
+    agent_label: Option<String>,
+
     /// State directory; defaults to `~/.veriguard-agent`.
     #[arg(long)]
     state_dir: Option<PathBuf>,
@@ -192,11 +196,16 @@ fn run_init_cli(cli: VeriguardCli) -> Result<(), Error> {
         onboard::run_init_install_pack(&pack_path, &state_dir)
             .map_err(|e| Error::Internal(format!("init --install-pack failed: {e}")))
     } else if args.bootstrap {
-        // Mode A bootstrap HTTP fetch lives in C1-Agent-2; this scaffold
-        // returns early with a clear error rather than silently doing nothing.
-        Err(Error::Internal(
-            "init --bootstrap not yet wired (C1-Agent-2)".to_string(),
-        ))
+        // Default agent label for bootstrap when not supplied.
+        let agent_label = args.agent_label.as_deref().unwrap_or("agent-bootstrap");
+        onboard::run_bootstrap(
+            args.platform_url.as_deref().unwrap_or(""),
+            args.onboard_token.as_deref().unwrap_or(""),
+            args.platform_cert_pin.as_deref().unwrap_or(""),
+            agent_label,
+            &state_dir,
+        )
+        .map_err(|e| Error::Internal(format!("init --bootstrap failed: {e}")))
     } else {
         Err(Error::Internal(
             "init requires either --install-pack <path> or --bootstrap ...".to_string(),
