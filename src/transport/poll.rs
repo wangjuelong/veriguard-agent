@@ -299,9 +299,22 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use crate::crypto::ed25519::generate_ed25519;
-    use crate::transport::proxy::http_client_with_proxy_env;
     use mockito::Server;
     use std::sync::Mutex;
+
+    /// Build a `blocking::Client` that explicitly bypasses any proxy in the
+    /// environment.  The upstream test
+    /// `tests::api::client::tests::test_with_proxy_disables_http_proxy`
+    /// mutates `HTTP_PROXY` mid-suite, which would otherwise route our
+    /// mockito requests off to a non-existent proxy host.  Using `no_proxy`
+    /// keeps these tests deterministic when run in parallel with that test.
+    fn no_proxy_client() -> reqwest::blocking::Client {
+        reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("blocking client")
+    }
 
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -350,7 +363,7 @@ mod tests {
             onboard_token: TOKEN.to_string(),
             capabilities: vec!["http_attack".to_string()],
             sign_priv: generate_ed25519(),
-            http_client: http_client_with_proxy_env(),
+            http_client: no_proxy_client(),
             poll_interval: Duration::from_millis(1),
             max_backoff: Duration::from_millis(8),
             stop: stop.clone(),
@@ -480,7 +493,7 @@ mod tests {
             onboard_token: TOKEN.to_string(),
             capabilities: vec!["http_attack".to_string(), "pcap_replay".to_string()],
             sign_priv: generate_ed25519(),
-            http_client: http_client_with_proxy_env(),
+            http_client: no_proxy_client(),
             poll_interval: Duration::from_millis(1),
             max_backoff: Duration::from_millis(1),
             stop,
@@ -503,7 +516,7 @@ mod tests {
             onboard_token: TOKEN.to_string(),
             capabilities: vec![],
             sign_priv: generate_ed25519(),
-            http_client: http_client_with_proxy_env(),
+            http_client: no_proxy_client(),
             poll_interval: Duration::from_millis(1),
             max_backoff: Duration::from_millis(1),
             stop,
