@@ -8,6 +8,8 @@ mod windows;
 // 公共 API 由 C1-Agent-2 在 api/process 层接入，本 PR 仅落地基础模块。
 #[allow(dead_code)]
 mod crypto;
+#[allow(dead_code)]
+mod state;
 
 #[cfg(test)]
 mod tests;
