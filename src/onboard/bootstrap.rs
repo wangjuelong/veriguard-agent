@@ -143,19 +143,54 @@ mod tests {
     }
 
     #[test]
-    fn test_bootstrap_rejects_invalid_agent_label() {
+    fn test_bootstrap_with_invalid_inputs_fails_on_bad_pub_key() {
+        // `run_bootstrap` synthesises an InstallPack with empty
+        // platform_*_pub fields (Mode-A HTTP fetch is C1-Agent-2 territory).
+        // `InstallPack::validate()` checks the pub keys BEFORE `agent_label`,
+        // so a bad label can't surface from this entry point — the empty
+        // pub key trips first.  This test pins that behaviour: any future
+        // reorder of validation that lets `BadAgentLabel` escape from
+        // `run_bootstrap` should fail here so the operator-facing error
+        // path stays predictable.
         let state_dir = tempdir().unwrap();
         let err = run_bootstrap(
             "https://veriguard.example.com",
             VALID_TOKEN,
             VALID_PIN,
-            "agent with spaces", // not in [A-Za-z0-9._-]
+            "agent with spaces", // also invalid, but masked by empty pub keys
             state_dir.path(),
         )
-        .expect_err("bad label");
-        // Field order in validate(): platform_pub keys are checked before
-        // agent_label, so empty platform pubs trip first.  Confirm we get
-        // SOME InstallPack error path.
-        assert!(matches!(err, BootstrapError::InstallPack(_)));
+        .expect_err("bad inputs");
+        assert!(
+            matches!(
+                &err,
+                BootstrapError::InstallPack(InstallPackError::BadPublicKey { field, .. })
+                    if *field == "platform_sign_pub"
+            ),
+            "expected BadPublicKey on platform_sign_pub, got {err:?}",
+        );
+    }
+
+    /// Bypass `run_bootstrap` so we can exercise `InstallPack::validate()`
+    /// directly with otherwise-valid pub keys but an invalid `agent_label`.
+    /// This is the test that actually pins `BadAgentLabel`.
+    #[test]
+    fn test_install_pack_with_valid_pubs_and_bad_label_rejects_with_bad_label() {
+        // Valid base64 of 32 zero bytes for both pub keys.
+        const VALID_PUB_B64: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let pack = InstallPack {
+            schema_version: "1.0".to_string(),
+            platform_url: "https://veriguard.example.com".to_string(),
+            platform_cert_pin: VALID_PIN.to_string(),
+            platform_sign_pub: VALID_PUB_B64.to_string(),
+            platform_enc_pub: VALID_PUB_B64.to_string(),
+            onboard_token: VALID_TOKEN.to_string(),
+            agent_label: "agent with spaces".to_string(),
+        };
+        let err = pack.validate().expect_err("must reject bad label");
+        assert!(
+            matches!(err, InstallPackError::BadAgentLabel(_)),
+            "expected BadAgentLabel, got {err:?}",
+        );
     }
 }
