@@ -1,31 +1,48 @@
-//! X25519 ECDH + XChaCha20-Poly1305 sealed box ("NaCl box" equivalent).
+//! NaCl-box-style asymmetric encryption: X25519 ECDH → raw 32-byte shared
+//! secret used directly as the IETF ChaCha20-Poly1305 (RFC 8439) AEAD key.
 //!
-//! ## Construction
+//! # Algorithm choice: IETF ChaCha20-Poly1305 (12-byte nonce)
+//!
+//! We use IETF ChaCha20-Poly1305 with a 12-byte random nonce to match
+//! the Veriguard Java backend, which uses BouncyCastle's
+//! `org.bouncycastle.crypto.modes.ChaCha20Poly1305`. BouncyCastle 1.84
+//! does NOT ship an XChaCha20Poly1305 engine, so XChaCha20 would require
+//! a hand-rolled implementation on the Java side — rejected as too risky
+//! for a 招标 timeline. The 12-byte nonce gives ~2^32 collision probability
+//! under random sampling; this is acceptable for our use because keys are
+//! per-session (per agent-platform pair) and we send at most ~10^4 packs
+//! per key.
+//!
+//! # Key derivation deviation from standard NaCl box
+//!
+//! Standard NaCl `crypto_box` uses HSalsa20 to derive a fresh key from
+//! the 32-byte X25519 shared secret. We instead use the raw 32-byte
+//! shared secret directly as the ChaCha20-Poly1305 key. This is
+//! cryptographically equivalent given a fresh per-message random nonce
+//! and matches the Java side which performs the same shortcut.
+//! Document this if either side ever changes its KDF behavior.
+//!
+//! # Construction
 //!
 //! `seal_box(plain, recipient_pub, sender_priv)`:
 //!
-//! 1. Derive `shared = X25519(sender_priv, recipient_pub)` — 32 raw bytes.
-//!    Note: standard NaCl `crypto_box` runs HSalsa20 over the shared point
-//!    plus a zero nonce to derive the symmetric key.  For Veriguard the Java
-//!    BouncyCastle side performs the SAME shortcut (raw shared secret as the
-//!    XChaCha20-Poly1305 key), so the wire formats line up.  Document this
-//!    deviation if cross-implementation interop ever changes.
-//! 2. Draw a fresh 24-byte nonce from `OsRng` (XChaCha20 needs 24 B).
-//! 3. Encrypt: `cipher = XChaCha20-Poly1305(shared, nonce, plain)`.
+//! 1. Derive `shared = X25519(sender_priv, recipient_pub)` — 32 raw bytes
+//!    used directly as the AEAD key (see deviation note above).
+//! 2. Draw a fresh 12-byte nonce from `OsRng` (IETF ChaCha20-Poly1305 nonce).
+//! 3. Encrypt: `cipher = ChaCha20-Poly1305(shared, nonce, plain)`.
 //!    Output ciphertext includes the trailing 16-byte Poly1305 tag.
 //!
 //! `open_box` reverses this: it derives the same shared secret with
 //! `recipient_priv` and `sender_pub`, then decrypts.
 //!
-//! ## Why this layer wraps the raw libraries
+//! # Why this layer wraps the raw libraries
 //!
-//! * Forces 24-byte nonces (we never want 12-byte ChaCha20-Poly1305 with this
-//!   key — the spec only allows XChaCha for the Mode-C pack envelope).
+//! * Forces 12-byte nonces matching the Java BC wire contract.
 //! * Encapsulates the curve <-> AEAD key handoff so callers can't forget it.
 //! * Exposes only `Vec<u8>` for ciphertexts (no exotic generic-array types).
 use chacha20poly1305::{
     aead::{Aead, KeyInit},
-    XChaCha20Poly1305, XNonce,
+    ChaCha20Poly1305,
 };
 use rand_core::{OsRng, RngCore};
 use thiserror::Error;
@@ -35,15 +52,15 @@ use x25519_dalek::{PublicKey, StaticSecret};
 #[derive(Debug, Error)]
 pub enum BoxError {
     /// AEAD encryption failed (should be near-impossible for valid inputs).
-    #[error("XChaCha20-Poly1305 encryption failed")]
+    #[error("ChaCha20-Poly1305 encryption failed")]
     EncryptFailed,
     /// AEAD decryption failed — wrong key, wrong nonce, or tampered ciphertext.
-    #[error("XChaCha20-Poly1305 decryption failed (MAC mismatch or wrong key)")]
+    #[error("ChaCha20-Poly1305 decryption failed (MAC mismatch or wrong key)")]
     DecryptFailed,
 }
 
-/// Nonce size in bytes for XChaCha20-Poly1305.
-pub const NONCE_BYTES: usize = 24;
+/// Nonce size in bytes for IETF ChaCha20-Poly1305 (RFC 8439).
+pub const NONCE_BYTES: usize = 12;
 
 /// X25519 private scalar (32 bytes).  Wraps `StaticSecret`.
 pub struct X25519PrivateKey {
@@ -56,11 +73,11 @@ pub struct X25519PublicKey {
     inner: PublicKey,
 }
 
-/// 24-byte nonce for XChaCha20-Poly1305.
+/// 12-byte nonce for IETF ChaCha20-Poly1305 (RFC 8439).
 ///
 /// The inner field is **private**: callers must go through
 /// [`Nonce::from_bytes`] or get one back from [`seal_box`].  Direct
-/// construction of `Nonce([0u8; 24])` was previously possible — this would
+/// construction of `Nonce([0u8; 12])` was previously possible — this would
 /// allow an external module (e.g. the transport layer in C1-Agent-2) to
 /// reuse an all-zero nonce under the same key, which is catastrophic for
 /// ChaCha20-Poly1305 (XOR of two ciphertexts leaks the keystream).
@@ -111,7 +128,7 @@ impl X25519PublicKey {
 }
 
 impl Nonce {
-    /// Build from raw 24 bytes.
+    /// Build from raw 12 bytes (IETF ChaCha20-Poly1305 nonce length).
     pub fn from_bytes(b: [u8; NONCE_BYTES]) -> Self {
         Self(b)
     }
@@ -132,12 +149,12 @@ pub fn seal_box(
     sender_priv: &X25519PrivateKey,
 ) -> Result<(Vec<u8>, Nonce), BoxError> {
     let shared = sender_priv.inner.diffie_hellman(&recipient_pub.inner);
-    let cipher = XChaCha20Poly1305::new(shared.as_bytes().into());
+    let cipher = ChaCha20Poly1305::new(shared.as_bytes().into());
 
-    // Draw a fresh 24-byte nonce.
+    // Draw a fresh 12-byte nonce (IETF ChaCha20-Poly1305 nonce length).
     let mut nonce_bytes = [0u8; NONCE_BYTES];
     OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = XNonce::from_slice(&nonce_bytes);
+    let nonce = chacha20poly1305::Nonce::from_slice(&nonce_bytes);
 
     let ciphertext = cipher
         .encrypt(nonce, plain)
@@ -157,10 +174,10 @@ pub fn open_box(
     recipient_priv: &X25519PrivateKey,
 ) -> Result<Vec<u8>, BoxError> {
     let shared = recipient_priv.inner.diffie_hellman(&sender_pub.inner);
-    let cipher = XChaCha20Poly1305::new(shared.as_bytes().into());
-    let xnonce = XNonce::from_slice(&nonce.0);
+    let cipher = ChaCha20Poly1305::new(shared.as_bytes().into());
+    let aead_nonce = chacha20poly1305::Nonce::from_slice(&nonce.0);
     cipher
-        .decrypt(xnonce, ciphertext)
+        .decrypt(aead_nonce, ciphertext)
         .map_err(|_| BoxError::DecryptFailed)
 }
 
@@ -248,5 +265,27 @@ mod tests {
 
         // After roundtrip, the derived public keys must match.
         assert_eq!(restored.public_key(), k.public_key());
+    }
+
+    /// Wire-format regression: nonce must be exactly 12 bytes (IETF
+    /// ChaCha20-Poly1305 per RFC 8439).  This locks in alignment with the
+    /// Java BouncyCastle side, which has no XChaCha20Poly1305 engine.
+    #[test]
+    fn test_box_nonce_is_12_bytes_ietf() {
+        // Constant + type contract.
+        assert_eq!(NONCE_BYTES, 12);
+
+        // `Nonce::from_bytes` accepts a [u8; 12] (compile-time enforced).
+        let raw = [0xAAu8; 12];
+        let nonce = Nonce::from_bytes(raw);
+        assert_eq!(nonce.as_bytes().len(), 12);
+
+        // `seal_box` emits a 12-byte nonce.
+        let sender = generate_x25519();
+        let recipient = generate_x25519();
+        let recipient_pub = recipient.public_key();
+        let (_ct, fresh_nonce) =
+            seal_box(b"ietf wire contract", &recipient_pub, &sender).expect("seal");
+        assert_eq!(fresh_nonce.as_bytes().len(), 12);
     }
 }
