@@ -34,7 +34,7 @@ pub mod proxy;
 pub mod sign;
 
 #[allow(unused_imports)]
-pub use poll::{PollError, Task, TaskDispatcher, TaskResult};
+pub use poll::{PollError, Poller, Task, TaskDispatcher, TaskResult};
 #[allow(unused_imports)]
 pub use proxy::http_client_with_proxy_env;
 #[allow(unused_imports)]
