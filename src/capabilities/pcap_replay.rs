@@ -134,7 +134,7 @@ impl Capability for PcapReplayCapability {
         // Integrity check.
         match sha256_of_file(&pcap_path) {
             Ok(actual) => {
-                if actual.to_ascii_lowercase() != payload.pcap_sha256.to_ascii_lowercase() {
+                if !actual.eq_ignore_ascii_case(&payload.pcap_sha256) {
                     return failed(format!(
                         "pcap sha256 mismatch: expected {} got {}",
                         payload.pcap_sha256, actual
