@@ -229,29 +229,24 @@ exit 0
 
     #[test]
     fn test_implant_drop_map_timeout_to_status_timeout() {
-        // Build a manager whose implant_path_override points at a
-        // never-exits script.  Use a tiny timeout so the test is fast.
-        let dir = tempdir().unwrap();
-        let slow = dir.path().join("sleep.sh");
-        std::fs::write(
-            &slow,
-            "#!/usr/bin/env bash\nsleep 30 > /dev/null 2>&1\nexit 0\n",
-        )
-        .unwrap();
-        let mut perms = std::fs::metadata(&slow).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&slow, perms).unwrap();
-
-        let mut m = ImplantManager::new("https://x".to_string(), dir.path().to_path_buf());
-        m.implant_path_override = Some(slow);
-        m.pipe_parent = dir.path().join("pipes");
-        let manager = Arc::new(m);
-
-        // Test the error-mapping helper directly so we don't have to wait for
-        // a real timeout (the read loop only checks timeout once per line).
+        // Verifying a slow-implant timeout end-to-end means waiting on the
+        // pipe read loop until the timeout boundary fires.  That makes the
+        // test brittle on slow CI runners, so we exercise the error-mapping
+        // path directly: the contract is that `ImplantError::Timeout` maps
+        // to `status="TIMEOUT"` regardless of the upstream cause.
         let result =
             map_implant_error_to_result(ImplantError::Timeout(std::time::Duration::from_secs(1)));
         assert_eq!(result.status, "TIMEOUT");
         assert!(result.error_message.unwrap().contains("timed out"));
+    }
+
+    #[test]
+    fn test_implant_drop_map_premature_exit_to_status_failed() {
+        // PrematureExit / Download / Io / Json all collapse to FAILED.
+        let result = map_implant_error_to_result(ImplantError::PrematureExit(
+            "implant died without result_final".to_string(),
+        ));
+        assert_eq!(result.status, "FAILED");
+        assert!(result.error_message.unwrap().contains("prematurely"));
     }
 }
