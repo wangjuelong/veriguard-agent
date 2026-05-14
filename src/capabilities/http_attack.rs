@@ -181,13 +181,18 @@ impl Capability for HttpAttackCapability {
 }
 
 fn failed_result(message: String) -> TaskResult {
+    // Capture timestamp once so started_at == finished_at — the task failed
+    // before any real work happened, so two separate now() calls would
+    // produce a misleading nanosecond-level "duration" that breaks SLA
+    // calculations on the platform side.
+    let at = rfc3339_now();
     TaskResult {
         status: "FAILED".to_string(),
         exit_code: 1,
         stdout: None,
         stderr: None,
-        started_at: Some(rfc3339_now()),
-        finished_at: Some(rfc3339_now()),
+        started_at: Some(at.clone()),
+        finished_at: Some(at),
         error_message: Some(message),
     }
 }
@@ -400,6 +405,21 @@ mod tests {
             .as_ref()
             .unwrap()
             .contains("invalid HTTP method"));
+    }
+
+    #[test]
+    fn test_failed_result_started_and_finished_match() {
+        // Pin the single-timestamp contract: a task that fails before doing
+        // any work must report started_at == finished_at (zero duration),
+        // not two nanosecond-apart timestamps from separate rfc3339_now()
+        // calls.
+        let r = failed_result("boom".to_string());
+        assert!(r.started_at.is_some());
+        assert!(r.finished_at.is_some());
+        assert_eq!(
+            r.started_at, r.finished_at,
+            "failed_result must use a single timestamp"
+        );
     }
 
     #[test]
