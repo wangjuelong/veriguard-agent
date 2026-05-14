@@ -174,6 +174,23 @@ impl Poller {
                         }
                     }
                 }
+                Err(PollError::BadStatus {
+                    status,
+                    endpoint,
+                    body,
+                }) if status == 401 || status == 403 => {
+                    // 401 = bad signature / expired token, 403 = revoked
+                    // agent — both are permanent config errors that cannot
+                    // be recovered by retrying.  Abort the loop so the
+                    // operator sees the failure instead of the agent
+                    // silently spinning at max_backoff.
+                    log::error!("permanent auth failure ({status}) — aborting poll loop");
+                    return Err(PollError::BadStatus {
+                        status,
+                        endpoint,
+                        body,
+                    });
+                }
                 Err(err) => {
                     warn!("poll fetch failed: {err}");
                     current_backoff = (current_backoff * 2).min(self.max_backoff);
@@ -484,6 +501,53 @@ mod tests {
 
         let dispatcher = RecordingDispatcher::new(vec![]);
         poller.run(&dispatcher).expect("run exits cleanly");
+    }
+
+    #[test]
+    fn test_poll_returns_on_permanent_auth_failure_401() {
+        // 401 = expired token / bad signature.  The loop must abort, not
+        // retry forever at max_backoff.
+        let mut server = Server::new();
+        server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/agent/poll.*".to_string()),
+            )
+            .with_status(401)
+            .with_body("invalid signature")
+            .expect_at_least(1)
+            .create();
+
+        let (poller, _stop) = poller_for(&server, 1);
+        let dispatcher = RecordingDispatcher::new(vec![]);
+        let err = poller.run(&dispatcher).expect_err("must abort on 401");
+        match err {
+            PollError::BadStatus { status, .. } => assert_eq!(status, 401),
+            other => panic!("expected BadStatus 401, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_poll_returns_on_permanent_auth_failure_403() {
+        // 403 = agent revoked.  Same fast-exit contract as 401.
+        let mut server = Server::new();
+        server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/agent/poll.*".to_string()),
+            )
+            .with_status(403)
+            .with_body("agent revoked")
+            .expect_at_least(1)
+            .create();
+
+        let (poller, _stop) = poller_for(&server, 1);
+        let dispatcher = RecordingDispatcher::new(vec![]);
+        let err = poller.run(&dispatcher).expect_err("must abort on 403");
+        match err {
+            PollError::BadStatus { status, .. } => assert_eq!(status, 403),
+            other => panic!("expected BadStatus 403, got {other:?}"),
+        }
     }
 
     #[test]
