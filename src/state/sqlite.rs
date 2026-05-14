@@ -24,7 +24,7 @@
 //! pack execution on a single thread so a non-pooled connection is fine; if
 //! future work moves to multi-threaded execution, wrap [`StateStore`] in a
 //! `Mutex` or migrate to a connection pool.
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use thiserror::Error;
@@ -32,12 +32,24 @@ use thiserror::Error;
 /// Errors emitted by the state store.
 #[derive(Debug, Error)]
 pub enum StateError {
-    /// Failed to open or initialize the SQLite database.
-    #[error("failed to open SQLite database: {0}")]
-    Open(#[source] rusqlite::Error),
+    /// Failed to open the SQLite database file at `path`.  This is distinct
+    /// from [`StateError::Sql`]: it carries the on-disk path so callers can
+    /// surface a meaningful "database file unreadable" message and is only
+    /// constructed by the explicit `open` call sites (never by the `?`
+    /// operator on query failures).
+    #[error("failed to open SQLite database at {path}: {source}")]
+    Open {
+        /// The filesystem path the agent tried to open.  Use
+        /// `<in-memory>` for [`StateStore::open_in_memory`].
+        path: PathBuf,
+        /// Underlying rusqlite open failure.
+        #[source]
+        source: rusqlite::Error,
+    },
 
-    /// SQL execution / query failure.
-    #[error("SQLite error: {0}")]
+    /// SQL execution / query failure.  Every `?` on a `rusqlite::Error`
+    /// inside this module maps here.
+    #[error("SQLite query error: {0}")]
     Sql(#[from] rusqlite::Error),
 }
 
@@ -49,14 +61,20 @@ pub struct StateStore {
 impl StateStore {
     /// Open (or create) the SQLite database at `path` and apply the schema.
     pub fn open(path: &Path) -> Result<Self, StateError> {
-        let conn = Connection::open(path).map_err(StateError::Open)?;
+        let conn = Connection::open(path).map_err(|source| StateError::Open {
+            path: path.to_path_buf(),
+            source,
+        })?;
         apply_schema(&conn)?;
         Ok(Self { conn })
     }
 
     /// Open an in-memory database — useful for tests.
     pub fn open_in_memory() -> Result<Self, StateError> {
-        let conn = Connection::open_in_memory().map_err(StateError::Open)?;
+        let conn = Connection::open_in_memory().map_err(|source| StateError::Open {
+            path: PathBuf::from("<in-memory>"),
+            source,
+        })?;
         apply_schema(&conn)?;
         Ok(Self { conn })
     }
@@ -199,5 +217,23 @@ mod tests {
         let store2 = StateStore::open(&path).expect("open #2");
         assert!(store2.is_executed("p1").unwrap());
         assert_eq!(store2.count_executed().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_state_open_invalid_path_returns_open_variant() {
+        // Path inside a non-existent directory cannot be opened by rusqlite;
+        // confirm the error is the disambiguated `Open { path, .. }` variant,
+        // not `Sql(_)`.  This pins the `From<rusqlite::Error>` impl so it
+        // can't silently start routing open failures to `StateError::Sql`.
+        // `StateStore` doesn't impl `Debug`, so we use `match` on `Result`
+        // rather than `expect_err()`.
+        let bad_path = Path::new("/nonexistent/dir/does/not/exist/state.sqlite");
+        match StateStore::open(bad_path) {
+            Ok(_) => panic!("open must fail for unreadable path"),
+            Err(StateError::Open { path, .. }) => {
+                assert_eq!(path, bad_path);
+            }
+            Err(other) => panic!("expected StateError::Open, got {other:?}"),
+        }
     }
 }
