@@ -4,8 +4,11 @@ mod config;
 mod process;
 mod windows;
 
-// Veriguard 二开 (C1-Agent-1): 加非对称密码学 + 离线包 onboarding 流程
-// 公共 API 由 C1-Agent-2 在 api/process 层接入，本 PR 仅落地基础模块。
+// Veriguard 二开 (C1-Agent-1 + C1-Agent-2): 非对称密码学 + 离线包 onboarding
+// + Mode A 在线 transport + capabilities + implant 子进程 — 通过 `run`
+// 子命令统一对外。`crypto` / `onboard` 暴露的完整 API 还有
+// X25519 box / install pack validation 等扩展面留给 C1-Integration 调用，
+// `state` 预留给 Mode C 离线包回放，本 PR 暂未消费。
 #[allow(dead_code)]
 mod crypto;
 #[allow(dead_code)]
@@ -13,12 +16,8 @@ mod onboard;
 #[allow(dead_code)]
 mod state;
 
-// Veriguard 二开 (C1-Agent-2): Mode A 在线 transport + capabilities + implant 子进程
-#[allow(dead_code)]
 mod capabilities;
-#[allow(dead_code)]
 mod implant;
-#[allow(dead_code)]
 mod transport;
 
 #[cfg(test)]
@@ -139,6 +138,7 @@ fn try_dispatch_subcommand() -> Option<Result<(), Error>> {
     // to the daemon path (which itself raises a clear error if it disagrees).
     match args[1].as_str() {
         "init" => Some(run_init_cli(VeriguardCli::parse())),
+        "run" => Some(run_run_cli(VeriguardCli::parse())),
         _ => None,
     }
 }
@@ -158,6 +158,8 @@ struct VeriguardCli {
 enum VeriguardCmd {
     /// First-run provisioning: load an install pack and generate keys.
     Init(InitArgs),
+    /// Mode-A daemon mode: poll the Veriguard platform for tasks and run them.
+    Run(RunArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -191,8 +193,26 @@ struct InitArgs {
     state_dir: Option<PathBuf>,
 }
 
+#[derive(clap::Args, Debug)]
+struct RunArgs {
+    /// State directory containing `keys/{sign,enc}.key` + `install-pack.json`.
+    /// Defaults to `~/.veriguard-agent`.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+
+    /// Override polling interval (seconds).  Defaults to 5s.
+    #[arg(long)]
+    poll_interval_secs: Option<u64>,
+
+    /// Override exponential-backoff cap (seconds).  Defaults to 300s.
+    #[arg(long)]
+    max_backoff_secs: Option<u64>,
+}
+
 fn run_init_cli(cli: VeriguardCli) -> Result<(), Error> {
-    let VeriguardCmd::Init(args) = cli.cmd;
+    let VeriguardCmd::Init(args) = cli.cmd else {
+        unreachable!("dispatcher only routes init args here")
+    };
     let state_dir = match args.state_dir.clone() {
         Some(p) => p,
         None => onboard::default_state_dir().ok_or_else(|| {
@@ -219,6 +239,83 @@ fn run_init_cli(cli: VeriguardCli) -> Result<(), Error> {
             "init requires either --install-pack <path> or --bootstrap ...".to_string(),
         ))
     }
+}
+
+/// Run the Mode-A daemon loop.  Loads keys + install pack from `state_dir`,
+/// constructs the capability registry, and hands off to the poll loop.
+fn run_run_cli(cli: VeriguardCli) -> Result<(), Error> {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let VeriguardCmd::Run(args) = cli.cmd else {
+        unreachable!("dispatcher only routes run args here")
+    };
+    let state_dir = match args.state_dir {
+        Some(p) => p,
+        None => onboard::default_state_dir().ok_or_else(|| {
+            Error::Internal("could not resolve $HOME; pass --state-dir explicitly".to_string())
+        })?,
+    };
+
+    let pack_path = state_dir.join("install-pack.json");
+    let pack = onboard::load_install_pack(&pack_path)
+        .map_err(|e| Error::Internal(format!("install pack missing or invalid: {e}")))?;
+
+    // For the alpha the install pack does not carry `agent_id` — that field
+    // is populated by the platform during `POST /api/agent/onboard/register`
+    // (C1-Platform-3).  Until that lands we use `agent_label` as the agent_id
+    // surrogate; the platform's scaffold AgentTaskQueueApi accepts whatever
+    // value the agent self-reports.
+    let agent_id = pack.agent_label.clone();
+    let onboard_token = pack.onboard_token.clone();
+    let platform_url = pack.platform_url.clone();
+
+    let sign_path = state_dir.join("keys").join("sign.key");
+    let sign_priv = crypto::load_ed25519_priv(&sign_path)
+        .map_err(|e| Error::Internal(format!("loading sign key: {e}")))?;
+
+    let poll_interval = Duration::from_secs(args.poll_interval_secs.unwrap_or(5));
+    let max_backoff = Duration::from_secs(args.max_backoff_secs.unwrap_or(300));
+
+    // Build capability registry.
+    let implant_manager = Arc::new(implant::ImplantManager::new(
+        platform_url.clone(),
+        state_dir.clone(),
+    ));
+    let mut registry = capabilities::Registry::new();
+    registry.register(Box::new(capabilities::HttpAttackCapability::new()));
+    registry.register(Box::new(
+        capabilities::PcapReplayCapability::with_state_dir(state_dir.join("pcaps")),
+    ));
+    registry.register(Box::new(capabilities::CommandInjectCapability::new(
+        implant_manager.clone(),
+    )));
+    registry.register(Box::new(capabilities::ImplantDropCapability::new(
+        implant_manager,
+    )));
+    let advertised = registry.names();
+
+    info!(
+        "veriguard-agent run: agent_id={agent_id:?} platform_url={platform_url:?} \
+         capabilities={advertised:?}"
+    );
+
+    let poller = transport::Poller {
+        platform_url,
+        agent_id,
+        onboard_token,
+        capabilities: advertised,
+        sign_priv,
+        http_client: transport::http_client_with_proxy_env(),
+        poll_interval,
+        max_backoff,
+        stop: Arc::new(AtomicBool::new(false)),
+    };
+    poller
+        .run(&registry)
+        .map_err(|e| Error::Internal(format!("poll loop exited with error: {e}")))?;
+    Ok(())
 }
 
 fn main() -> Result<(), Error> {

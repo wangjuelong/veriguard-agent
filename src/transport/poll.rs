@@ -144,8 +144,10 @@ struct PollOutput {
 
 impl Poller {
     /// Default poll interval (5s).
+    #[allow(dead_code)]
     pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
     /// Default upper bound on backoff (5min).
+    #[allow(dead_code)]
     pub const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(300);
 
     /// Run the poll loop until `self.stop` is set.

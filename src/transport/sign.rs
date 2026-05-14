@@ -48,6 +48,7 @@ pub struct SignedRequest {
 
 impl SignedRequest {
     /// Borrow the raw `X-Veriguard-Timestamp` value.
+    #[allow(dead_code)]
     pub fn timestamp(&self) -> &str {
         // index 1 corresponds to the TS_HEADER pair built in [`build`].
         &self.headers[1].1

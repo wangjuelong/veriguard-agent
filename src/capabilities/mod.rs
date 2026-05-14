@@ -84,11 +84,13 @@ impl Registry {
     }
 
     /// Number of registered capabilities.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.caps.len()
     }
 
     /// `true` when no capabilities are registered.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.caps.is_empty()
     }

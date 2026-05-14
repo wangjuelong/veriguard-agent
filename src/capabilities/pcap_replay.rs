@@ -75,6 +75,7 @@ impl PcapReplayCapability {
     }
 
     /// Override the HTTP client (used by tests that need `no_proxy()`).
+    #[allow(dead_code)]
     pub fn with_http_client(mut self, client: reqwest::blocking::Client) -> Self {
         self.http_client = client;
         self
@@ -82,6 +83,7 @@ impl PcapReplayCapability {
 
     /// Override the `tcpreplay` binary path.  Tests use this to point at a
     /// stub script so the test doesn't depend on a real `tcpreplay` install.
+    #[allow(dead_code)]
     pub fn with_tcpreplay_path(mut self, path: String) -> Self {
         self.tcpreplay_path = path;
         self
