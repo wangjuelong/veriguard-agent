@@ -15,6 +15,8 @@ mod state;
 
 // Veriguard 二开 (C1-Agent-2): Mode A 在线 transport + capabilities + implant 子进程
 #[allow(dead_code)]
+mod capabilities;
+#[allow(dead_code)]
 mod transport;
 
 #[cfg(test)]
