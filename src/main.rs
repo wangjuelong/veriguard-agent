@@ -9,6 +9,8 @@ mod windows;
 #[allow(dead_code)]
 mod crypto;
 #[allow(dead_code)]
+mod onboard;
+#[allow(dead_code)]
 mod state;
 
 #[cfg(test)]
