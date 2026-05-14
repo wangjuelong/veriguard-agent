@@ -113,6 +113,97 @@ fn agent_start(settings_data: Settings, is_service: bool) -> Result<Vec<JoinHand
     ])
 }
 
+/// Veriguard 二开 CLI subcommand dispatch.
+///
+/// We retain upstream's zero-arg daemon path (so existing systemd /
+/// Windows-service launchers keep working) and only route off if the user
+/// passes a known subcommand.  This keeps the surface clearly partitioned
+/// between "legacy daemon" and "二开 init/register" flows.
+fn try_dispatch_subcommand() -> Option<Result<(), Error>> {
+    use clap::Parser;
+
+    let args: Vec<String> = env::args().collect();
+    // Treat as legacy daemon when no args at all.
+    if args.len() < 2 {
+        return None;
+    }
+    // Only intercept subcommands we know about; everything else falls through
+    // to the daemon path (which itself raises a clear error if it disagrees).
+    match args[1].as_str() {
+        "init" => Some(run_init_cli(VeriguardCli::parse())),
+        _ => None,
+    }
+}
+
+#[derive(clap::Parser, Debug)]
+#[command(
+    name = "veriguard-agent",
+    version,
+    about = "Veriguard 平台自有验证 Agent — `init` provisioning + daemon mode"
+)]
+struct VeriguardCli {
+    #[command(subcommand)]
+    cmd: VeriguardCmd,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum VeriguardCmd {
+    /// First-run provisioning: load an install pack and generate keys.
+    Init(InitArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct InitArgs {
+    /// Path to a Mode-C offline install pack (JSON).
+    #[arg(long, conflicts_with = "bootstrap")]
+    install_pack: Option<PathBuf>,
+
+    /// Run Mode-A online bootstrap (HTTP fetch is implemented in C1-Agent-2).
+    #[arg(long, default_value_t = false)]
+    bootstrap: bool,
+
+    /// Required with `--bootstrap`: HTTPS URL of the Veriguard platform.
+    #[arg(long, requires = "bootstrap")]
+    platform_url: Option<String>,
+
+    /// Required with `--bootstrap`: 64-hex single-use enrolment token.
+    #[arg(long, requires = "bootstrap")]
+    onboard_token: Option<String>,
+
+    /// Required with `--bootstrap`: TLS cert pin (`sha256:<hex>`).
+    #[arg(long, requires = "bootstrap")]
+    platform_cert_pin: Option<String>,
+
+    /// State directory; defaults to `~/.veriguard-agent`.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+}
+
+fn run_init_cli(cli: VeriguardCli) -> Result<(), Error> {
+    let VeriguardCmd::Init(args) = cli.cmd;
+    let state_dir = match args.state_dir.clone() {
+        Some(p) => p,
+        None => onboard::default_state_dir().ok_or_else(|| {
+            Error::Internal("could not resolve $HOME; pass --state-dir explicitly".to_string())
+        })?,
+    };
+
+    if let Some(pack_path) = args.install_pack {
+        onboard::run_init_install_pack(&pack_path, &state_dir)
+            .map_err(|e| Error::Internal(format!("init --install-pack failed: {e}")))
+    } else if args.bootstrap {
+        // Mode A bootstrap HTTP fetch lives in C1-Agent-2; this scaffold
+        // returns early with a clear error rather than silently doing nothing.
+        Err(Error::Internal(
+            "init --bootstrap not yet wired (C1-Agent-2)".to_string(),
+        ))
+    } else {
+        Err(Error::Internal(
+            "init requires either --install-pack <path> or --bootstrap ...".to_string(),
+        ))
+    }
+}
+
 fn main() -> Result<(), Error> {
     set_error_hook();
     // region Init logger
@@ -127,6 +218,12 @@ fn main() -> Result<(), Error> {
         .with_writer(file_writer)
         .init();
     // endregion
+
+    // 二开 CLI: 当用户传 `init ...` 子命令时短路 daemon 路径。
+    if let Some(result) = try_dispatch_subcommand() {
+        return result;
+    }
+
     // region Process execution
     info!("Starting OpenAEV agent {} ({})", VERSION, Settings::mode());
     let settings = Settings::new();
