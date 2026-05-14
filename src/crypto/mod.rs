@@ -6,10 +6,13 @@
 //! for sealing Mode-C offline packs).  Veriguard's Java backend uses the
 //! same primitives via BouncyCastle, so the wire format is interoperable.
 
+pub mod cert_pin;
 pub mod ed25519;
 pub mod keys;
 pub mod x25519_box;
 
+#[allow(unused_imports)]
+pub use cert_pin::{cert_sha256, verify_cert_pin, CertPinError};
 #[allow(unused_imports)]
 pub use ed25519::{
     generate_ed25519, Ed25519Error, Ed25519PrivateKey, Ed25519PublicKey, Ed25519Signature,
