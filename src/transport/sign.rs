@@ -50,8 +50,14 @@ impl SignedRequest {
     /// Borrow the raw `X-Veriguard-Timestamp` value.
     #[allow(dead_code)]
     pub fn timestamp(&self) -> &str {
-        // index 1 corresponds to the TS_HEADER pair built in [`build`].
-        &self.headers[1].1
+        // Find by header name rather than positional index.  This stays
+        // correct even if [`build`] ever reorders headers, where a hard
+        // `&self.headers[1].1` would silently return the wrong value.
+        self.headers
+            .iter()
+            .find(|(k, _)| k == TS_HEADER)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("")
     }
 }
 
@@ -226,6 +232,30 @@ mod tests {
 
         // Verifying body-only must NOT verify — timestamp is required prefix.
         assert!(!pubk.verify(body, &sig));
+    }
+
+    #[test]
+    fn test_timestamp_accessor_finds_by_name_not_index() {
+        // Construct a SignedRequest with headers in a non-default order.
+        // The accessor must locate TS_HEADER by name, NOT by index 1.
+        let shuffled = SignedRequest {
+            headers: vec![
+                (TS_HEADER.to_string(), "1715688000000".to_string()),
+                (SIG_HEADER.to_string(), "dummy-sig".to_string()),
+                (TOKEN_HEADER.to_string(), TOKEN.to_string()),
+            ],
+        };
+        assert_eq!(shuffled.timestamp(), "1715688000000");
+
+        // Reverse order again.
+        let other = SignedRequest {
+            headers: vec![
+                (TOKEN_HEADER.to_string(), TOKEN.to_string()),
+                (SIG_HEADER.to_string(), "dummy-sig".to_string()),
+                (TS_HEADER.to_string(), "9999999999999".to_string()),
+            ],
+        };
+        assert_eq!(other.timestamp(), "9999999999999");
     }
 
     #[test]
