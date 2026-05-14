@@ -17,6 +17,8 @@ mod state;
 #[allow(dead_code)]
 mod capabilities;
 #[allow(dead_code)]
+mod implant;
+#[allow(dead_code)]
 mod transport;
 
 #[cfg(test)]

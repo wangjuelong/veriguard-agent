@@ -30,6 +30,10 @@ base64 = "0.22"
 dirs = "5"
 clap = { version = "4.5", features = ["derive"] }
 
+[target.'cfg(unix)'.dependencies]
+# Veriguard 二开 (C1-Agent-2): mkfifo for implant result pipe
+nix = { version = "0.29", features = ["fs"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8.0"
 windows-service-detector = "0.1.0"
