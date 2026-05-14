@@ -4,6 +4,15 @@ mod config;
 mod process;
 mod windows;
 
+// Veriguard 二开 (C1-Agent-1): 加非对称密码学 + 离线包 onboarding 流程
+// 公共 API 由 C1-Agent-2 在 api/process 层接入，本 PR 仅落地基础模块。
+#[allow(dead_code)]
+mod crypto;
+#[allow(dead_code)]
+mod onboard;
+#[allow(dead_code)]
+mod state;
+
 #[cfg(test)]
 mod tests;
 
@@ -104,6 +113,106 @@ fn agent_start(settings_data: Settings, is_service: bool) -> Result<Vec<JoinHand
     ])
 }
 
+/// Veriguard 二开 CLI subcommand dispatch.
+///
+/// We retain upstream's zero-arg daemon path (so existing systemd /
+/// Windows-service launchers keep working) and only route off if the user
+/// passes a known subcommand.  This keeps the surface clearly partitioned
+/// between "legacy daemon" and "二开 init/register" flows.
+fn try_dispatch_subcommand() -> Option<Result<(), Error>> {
+    use clap::Parser;
+
+    let args: Vec<String> = env::args().collect();
+    // Treat as legacy daemon when no args at all.
+    if args.len() < 2 {
+        return None;
+    }
+    // Only intercept subcommands we know about; everything else falls through
+    // to the daemon path (which itself raises a clear error if it disagrees).
+    match args[1].as_str() {
+        "init" => Some(run_init_cli(VeriguardCli::parse())),
+        _ => None,
+    }
+}
+
+#[derive(clap::Parser, Debug)]
+#[command(
+    name = "veriguard-agent",
+    version,
+    about = "Veriguard 平台自有验证 Agent — `init` provisioning + daemon mode"
+)]
+struct VeriguardCli {
+    #[command(subcommand)]
+    cmd: VeriguardCmd,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum VeriguardCmd {
+    /// First-run provisioning: load an install pack and generate keys.
+    Init(InitArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct InitArgs {
+    /// Path to a Mode-C offline install pack (JSON).
+    #[arg(long, conflicts_with = "bootstrap")]
+    install_pack: Option<PathBuf>,
+
+    /// Run Mode-A online bootstrap (HTTP fetch is implemented in C1-Agent-2).
+    #[arg(long, default_value_t = false)]
+    bootstrap: bool,
+
+    /// Required with `--bootstrap`: HTTPS URL of the Veriguard platform.
+    #[arg(long, requires = "bootstrap")]
+    platform_url: Option<String>,
+
+    /// Required with `--bootstrap`: 64-hex single-use enrolment token.
+    #[arg(long, requires = "bootstrap")]
+    onboard_token: Option<String>,
+
+    /// Required with `--bootstrap`: TLS cert pin (`sha256:<hex>`).
+    #[arg(long, requires = "bootstrap")]
+    platform_cert_pin: Option<String>,
+
+    /// Optional with `--bootstrap`: agent label.  Defaults to `agent-bootstrap`.
+    #[arg(long, requires = "bootstrap")]
+    agent_label: Option<String>,
+
+    /// State directory; defaults to `~/.veriguard-agent`.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+}
+
+fn run_init_cli(cli: VeriguardCli) -> Result<(), Error> {
+    let VeriguardCmd::Init(args) = cli.cmd;
+    let state_dir = match args.state_dir.clone() {
+        Some(p) => p,
+        None => onboard::default_state_dir().ok_or_else(|| {
+            Error::Internal("could not resolve $HOME; pass --state-dir explicitly".to_string())
+        })?,
+    };
+
+    if let Some(pack_path) = args.install_pack {
+        onboard::run_init_install_pack(&pack_path, &state_dir)
+            .map_err(|e| Error::Internal(format!("init --install-pack failed: {e}")))
+    } else if args.bootstrap {
+        // Default agent label for bootstrap when not supplied.
+        let agent_label = args.agent_label.as_deref().unwrap_or("agent-bootstrap");
+        onboard::run_bootstrap(
+            args.platform_url.as_deref().unwrap_or(""),
+            args.onboard_token.as_deref().unwrap_or(""),
+            args.platform_cert_pin.as_deref().unwrap_or(""),
+            agent_label,
+            &state_dir,
+        )
+        .map_err(|e| Error::Internal(format!("init --bootstrap failed: {e}")))
+    } else {
+        Err(Error::Internal(
+            "init requires either --install-pack <path> or --bootstrap ...".to_string(),
+        ))
+    }
+}
+
 fn main() -> Result<(), Error> {
     set_error_hook();
     // region Init logger
@@ -118,6 +227,12 @@ fn main() -> Result<(), Error> {
         .with_writer(file_writer)
         .init();
     // endregion
+
+    // 二开 CLI: 当用户传 `init ...` 子命令时短路 daemon 路径。
+    if let Some(result) = try_dispatch_subcommand() {
+        return result;
+    }
+
     // region Process execution
     info!("Starting OpenAEV agent {} ({})", VERSION, Settings::mode());
     let settings = Settings::new();

@@ -18,9 +18,23 @@ tracing-subscriber = { version = "0.3.18", features = ["json"] }
 tracing-appender = "0.2.3"
 rolling-file = "0.2.0"
 
+# Veriguard 二开 (C1-Agent-1): 非对称密码学 + Mode C 离线包 + onboarding
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+rand_core = { version = "0.6", features = ["std"] }
+rusqlite = { version = "0.36", features = ["bundled"] }
+thiserror = "1"
+sha2 = "0.10"
+base64 = "0.22"
+dirs = "5"
+clap = { version = "4.5", features = ["derive"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8.0"
 windows-service-detector = "0.1.0"
 
 [dev-dependencies]
 mockito = "1.7.0"
+tempfile = "3"
+assert_cmd = "2"
