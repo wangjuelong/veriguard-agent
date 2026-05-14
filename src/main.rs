@@ -4,6 +4,11 @@ mod config;
 mod process;
 mod windows;
 
+// Veriguard 二开 (C1-Agent-1): 加非对称密码学 + 离线包 onboarding 流程
+// 公共 API 由 C1-Agent-2 在 api/process 层接入，本 PR 仅落地基础模块。
+#[allow(dead_code)]
+mod crypto;
+
 #[cfg(test)]
 mod tests;
 
