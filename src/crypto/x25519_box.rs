@@ -57,8 +57,15 @@ pub struct X25519PublicKey {
 }
 
 /// 24-byte nonce for XChaCha20-Poly1305.
+///
+/// The inner field is **private**: callers must go through
+/// [`Nonce::from_bytes`] or get one back from [`seal_box`].  Direct
+/// construction of `Nonce([0u8; 24])` was previously possible — this would
+/// allow an external module (e.g. the transport layer in C1-Agent-2) to
+/// reuse an all-zero nonce under the same key, which is catastrophic for
+/// ChaCha20-Poly1305 (XOR of two ciphertexts leaks the keystream).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Nonce(pub [u8; NONCE_BYTES]);
+pub struct Nonce([u8; NONCE_BYTES]);
 
 /// Generate a fresh X25519 keypair using the OS RNG.
 pub fn generate_x25519() -> X25519PrivateKey {
