@@ -1,7 +1,9 @@
 [package]
-name = "openaev-agent"
-version = "2.3.5"
+name = "veriguard-agent"
+version = "0.1.0"
 edition = "2021"
+description = "Veriguard 平台自有验证 Agent (forked from OpenAEV-Platform/agent@531f9d12)"
+license = "Apache-2.0"
 
 [dependencies]
 reqwest = { version = "0.12.15", features = ["blocking", "rustls-tls", "rustls-tls-native-roots", "json"], default-features = false }

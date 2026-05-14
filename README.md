@@ -1,153 +1,30 @@
-# OpenAEV Agent
+# veriguard-agent
 
-[![Website](https://img.shields.io/badge/website-openaev.io-blue.svg)](https://openaev.io)
-[![CircleCI](https://circleci.com/gh/OpenAEV-Platform/agent.svg?style=shield)](https://circleci.com/gh/OpenAEV-Platform/agent/tree/main)
-[![GitHub release](https://img.shields.io/github/release/OpenAEV-Platform/agent.svg)](https://github.com/OpenAEV-Platform/agent/releases/latest)
-[![Slack Status](https://img.shields.io/badge/slack-3K%2B%20members-4A154B)](https://community.filigran.io)
+**Veriguard 平台自有验证 Agent**——府谷电力 IPv6 安全验证系统招标 §9.2 自建模块。
 
-The following repository is used to store the OpenAEV agent for the platform. For performance and low level access, the agent is written in Rust. Please start your journey with https://doc.rust-lang.org/book.
+## Upstream attribution
 
----
+Forked from [OpenAEV-Platform/agent](https://github.com/OpenAEV-Platform/agent) at commit `531f9d120a92f1af3ce78b0c37a356738584af18` (release 2.3.5).
 
-## 🚀 Installation
+**Fork 后一次性脱钩**：两仓代码完全独立演化，不跟上游 patch / 不做 cherry-pick / 不强求协议兼容。上游归属仅作 LICENSE Apache 2.0 attribution 用途。
 
-Agent installation is fully managed by the OpenAEV platform.
+## Project context
 
-You can find more information on the [official documentation](https://docs.openaev.io/latest/usage/openaev-agent/?h=agent).
+本仓与 `wangjuelong/veriguard-implant` 协作，在 [`wangjuelong/Veriguard`](https://github.com/wangjuelong/Veriguard) 主仓（Java 后端）的指令下，完成 §3 边界 / §4 流量 / §5 主机三场景的真实模拟攻击。
 
-## 🛠 Development
+详细设计：
+- Spec: `docs/superpowers/specs/2026-05-14-veriguard-agent-implant-fork-c1-c2-design.md`
+- Plan: `docs/superpowers/plans/2026-05-14-veriguard-agent-implant-fork-c1-c2-plan.md`
 
-The agent is written in [Rust](https://www.rust-lang.org/). If you're new to Rust, start with [The Rust Book](https://doc.rust-lang.org/book).
-
-### Prerequisites
-
-- [Rust](https://rustup.rs/)
-- [Cargo](https://doc.rust-lang.org/cargo/)
-- Linux, macOS, or Windows
-
-### Build
+## Build
 
 ```bash
-cargo build
+cargo build --release         # native build
+cargo zigbuild --target x86_64-unknown-linux-gnu --release   # cross-compile
 ```
 
----
+CI: `.github/workflows/release.yml` (matrix 6 binary: Linux/Win/macOS × x86_64/arm64)
 
-## ✅ Running Tests
+## License
 
-Run all tests (unit + integration):
-
-```bash
-cargo test
-```
-
-Run a specific test:
-
-```bash
-cargo test test_name
-```
-
----
-
-## 📊 Code Coverage
-
-Requires [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov):
-
-```bash
-cargo install cargo-llvm-cov
-cargo llvm-cov --html
-```
-
----
-
-## 🧹 Code Quality Guidelines
-
-### Clippy
-
-Run locally:
-
-```bash
-cargo clippy -- -D warnings
-```
-
-Auto-fix:
-
-```bash
-cargo fix --clippy
-```
-
-Clippy runs in CI — all warnings must be fixed for the pipeline to pass.
-
----
-
-### Rustfmt
-
-Check formatting:
-
-```bash
-cargo fmt -- --check
-```
-
-Fix formatting:
-
-```bash
-cargo fmt
-```
-
-Rustfmt runs in CI to enforce formatting.
-
----
-
-### Cargo Audit
-
-Check dependencies for known vulnerabilities:
-
-```bash
-cargo audit
-```
-
-Update vulnerable packages:
-
-```bash
-cargo update
-```
-
-Audit is included in CI to block new vulnerabilities.
-
----
-
-## 🧪 Tests in CI
-
-All tests are run automatically in the CI pipeline using:
-
-```bash
-cargo test
-```
-
-Builds will fail if any tests or quality checks fail.
-
----
-
-## 🛠 Troubleshooting in Development Mode
-
-When running the agent in development mode using:
-
-```bash
-cargo run -- start
-```
-
-All logs are written to:
-
-```
-target/debug/openaev-agent.log
-```
-
-Check this file if something isn’t working or you need to debug an issue locally.
-
----
-
-## 🧬 About
-
-OpenAEV is developed by [Filigran](https://filigran.io), a company dedicated to building open-source security tooling.
-
-<a href="https://filigran.io" alt="Filigran"><img src="https://github.com/OpenCTI-Platform/opencti/raw/master/.github/img/logo_filigran.png" width="300" /></a>
+Apache 2.0 (inherited from upstream OpenAEV-Platform/agent).
