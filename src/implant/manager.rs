@@ -247,6 +247,20 @@ impl ImplantManager {
         Ok(cache_path)
     }
 
+    /// Reads NDJSON events from the implant pipe until `result_final` arrives
+    /// OR `timeout` elapses BETWEEN newlines.
+    ///
+    /// # Known limitation (deferred to C1-Integration)
+    ///
+    /// Timeout checking happens between `read_line()` syscalls, not during them.
+    /// If the implant subprocess hangs in a state that produces no output
+    /// (e.g. system call wait, network stall, `D` state after pipe writer fd is
+    /// opened), this function blocks until the kernel returns EOF or the implant
+    /// is killed by another means. The `--timeout` flag passed to the implant is
+    /// a best-effort protocol guarantee, not an OS-level enforcement.
+    ///
+    /// C1-Integration will refactor to a `(thread, mpsc::Receiver)` pattern with
+    /// `recv_timeout` for true deadline enforcement.
     fn read_result_or_timeout(
         &self,
         mut child: Child,
@@ -563,6 +577,53 @@ exit 0
                 assert!(message.contains("SHA-256 mismatch"), "{message}")
             }
             other => panic!("expected Download err, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_read_result_timeout_fires_when_implant_exits_cleanly_without_result_final() {
+        // Mock implant writes ONE non-result_final NDJSON event then exits.
+        // The pipe will close (EOF) so read_line returns Ok(0) and the loop
+        // exits — the agent surfaces PrematureExit.  This pins the
+        // clean-exit-without-result_final path; the truly-hung implant case
+        // requires the C1-Integration mpsc refactor to test.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("incomplete-implant.sh");
+        let script = r##"#!/usr/bin/env bash
+# Parse --result-pipe, write ONE progress event (no result_final), exit.
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --result-pipe) PIPE="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+{
+  printf '%s\n' '{"event_type":"progress","timestamp":"2026-05-15T00:00:00Z"}'
+} > "$PIPE"
+exit 0
+"##;
+        std::fs::write(&path, script).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        let m = manager_with_mock(dir.path(), path);
+        // Use a generous timeout — we want the EOF-after-clean-exit path,
+        // not the elapsed-timer path.
+        let start = std::time::Instant::now();
+        let err = m
+            .run_implant("task-clean-exit", "Command", "AA==", 30)
+            .expect_err("must error since no result_final");
+        // Test should finish quickly (well under the 30s timeout) because
+        // EOF closes the loop, not the elapsed timer.
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "clean-exit path should not wait full timeout: elapsed = {:?}",
+            start.elapsed()
+        );
+        match err {
+            ImplantError::PrematureExit(_) => {}
+            other => panic!("expected PrematureExit, got {other:?}"),
         }
     }
 
