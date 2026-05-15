@@ -170,6 +170,37 @@ pub fn seal_box(
     Ok((ciphertext, Nonce(nonce_bytes)))
 }
 
+/// Variant of [`seal_box`] that uses a **caller-supplied** nonce instead of an
+/// `OsRng`-generated one.
+///
+/// # ⚠️ TEST-ONLY — DO NOT USE IN PRODUCTION
+///
+/// This entry point exists exclusively so cross-language regression tests can
+/// produce byte-for-byte deterministic `.vpack` / `.vresults` envelopes from a
+/// fixed test vector (keys + nonce + plaintext). Reusing a `(key, nonce)` pair
+/// for two distinct plaintexts under ChaCha20-Poly1305 breaks both
+/// confidentiality and authentication — the production [`seal_box`] enforces
+/// uniqueness by drawing a fresh 12-byte random nonce per call; this variant
+/// hands that responsibility to the caller.
+///
+/// The only legitimate use case is golden-fixture generation under test
+/// (see `tests/cross_lang_fixture.rs`). Production code paths must call
+/// [`seal_box`].
+#[doc(hidden)]
+pub fn seal_box_with_nonce(
+    plain: &[u8],
+    nonce: &Nonce,
+    recipient_pub: &X25519PublicKey,
+    sender_priv: &X25519PrivateKey,
+) -> Result<Vec<u8>, BoxError> {
+    let shared = sender_priv.inner.diffie_hellman(&recipient_pub.inner);
+    let cipher = ChaCha20Poly1305::new(shared.as_bytes().into());
+    let nonce_obj = chacha20poly1305::Nonce::from_slice(nonce.as_bytes());
+    cipher
+        .encrypt(nonce_obj, plain)
+        .map_err(|_| BoxError::EncryptFailed)
+}
+
 /// Decrypt ciphertext sealed by `seal_box`.
 ///
 /// Returns the plaintext on success, or [`BoxError::DecryptFailed`] for any
@@ -295,5 +326,35 @@ mod tests {
         let (_ct, fresh_nonce) =
             seal_box(b"ietf wire contract", &recipient_pub, &sender).expect("seal");
         assert_eq!(fresh_nonce.as_bytes().len(), 12);
+    }
+
+    #[test]
+    fn test_seal_box_with_nonce_deterministic_and_openable() {
+        // Fixed key + fixed nonce + fixed plaintext → fixed ciphertext (used by
+        // cross-language regression fixtures; see tests/cross_lang_fixture.rs).
+        let sender = X25519PrivateKey::from_bytes(&[0x11u8; 32]);
+        let recipient = X25519PrivateKey::from_bytes(&[0x22u8; 32]);
+        let recipient_pub = recipient.public_key();
+        let sender_pub = sender.public_key();
+        let nonce = Nonce::from_bytes([0x33u8; 12]);
+        let plain = b"deterministic fixture body";
+
+        let ct1 = seal_box_with_nonce(plain, &nonce, &recipient_pub, &sender).expect("seal#1");
+        let ct2 = seal_box_with_nonce(plain, &nonce, &recipient_pub, &sender).expect("seal#2");
+        assert_eq!(
+            ct1, ct2,
+            "seal_box_with_nonce must produce identical bytes for identical inputs"
+        );
+        assert_eq!(
+            ct1.len(),
+            plain.len() + 16,
+            "ChaCha20-Poly1305 tag overhead is 16 bytes"
+        );
+
+        // Open via the regular `open_box` to confirm wire compatibility with the
+        // production path — the production decryptor must accept ciphertext from
+        // this test-only sealer without modification.
+        let recovered = open_box(&ct1, &nonce, &sender_pub, &recipient).expect("open");
+        assert_eq!(recovered, plain);
     }
 }
