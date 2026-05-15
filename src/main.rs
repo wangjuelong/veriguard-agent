@@ -23,6 +23,14 @@ mod state;
 #[allow(dead_code)]
 mod pack;
 
+// Veriguard 二开 (C1-Agent-3): service install (A.8.1 Linux systemd; A.8.2
+// launchd / A.8.3 Windows-SCM stubs return clear "not yet implemented").
+// `dead_code` allow is needed because cargo on non-Linux dev hosts sees
+// the Linux-only systemd helpers as unreachable; the test suite still
+// exercises them on every CI run.
+#[allow(dead_code)]
+mod install;
+
 mod capabilities;
 mod implant;
 mod transport;
@@ -146,6 +154,7 @@ fn try_dispatch_subcommand() -> Option<Result<(), Error>> {
     match args[1].as_str() {
         "init" => Some(run_init_cli(VeriguardCli::parse())),
         "run" => Some(run_run_cli(VeriguardCli::parse())),
+        "install" => Some(run_install_cli(VeriguardCli::parse())),
         _ => None,
     }
 }
@@ -167,6 +176,8 @@ enum VeriguardCmd {
     Init(InitArgs),
     /// Mode-A daemon mode: poll the Veriguard platform for tasks and run them.
     Run(RunArgs),
+    /// Install the agent as a system service (Linux systemd in A.8.1).
+    Install(InstallArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -214,6 +225,36 @@ struct RunArgs {
     /// Override exponential-backoff cap (seconds).  Defaults to 300s.
     #[arg(long)]
     max_backoff_secs: Option<u64>,
+}
+
+#[derive(clap::Args, Debug)]
+struct InstallArgs {
+    /// Path to the agent binary the service unit will exec.  Defaults to
+    /// `/usr/local/bin/veriguard-agent` (matches the one-line curl install).
+    #[arg(long)]
+    binary_path: Option<PathBuf>,
+
+    /// State directory passed to `veriguard-agent run --state-dir`.
+    /// Defaults to `/var/lib/veriguard`.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+
+    /// Systemd unit name (no `.service` suffix).  Defaults to `veriguard-agent`.
+    #[arg(long)]
+    service_name: Option<String>,
+
+    /// Service `User=` (also used for `Group=`).  Defaults to `veriguard`.
+    #[arg(long)]
+    service_user: Option<String>,
+
+    /// Write the unit file but skip `systemctl daemon-reload && enable --now`.
+    #[arg(long, default_value_t = false)]
+    no_enable: bool,
+
+    /// Render the unit file to stdout without writing or running systemctl.
+    /// Useful for pre-prod review or air-gapped operators.
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
 }
 
 fn run_init_cli(cli: VeriguardCli) -> Result<(), Error> {
@@ -322,6 +363,59 @@ fn run_run_cli(cli: VeriguardCli) -> Result<(), Error> {
     poller
         .run(&registry)
         .map_err(|e| Error::Internal(format!("poll loop exited with error: {e}")))?;
+    Ok(())
+}
+
+/// Render + (optionally) install the systemd unit file for the agent.
+///
+/// On Linux this writes `/etc/systemd/system/<name>.service` and runs
+/// `systemctl daemon-reload && enable --now` unless `--no-enable` or
+/// `--dry-run` is passed.  On macOS / Windows the underlying dispatcher
+/// returns a clear "not yet implemented" error pointing at the future
+/// A.8.2 / A.8.3 commits.
+fn run_install_cli(cli: VeriguardCli) -> Result<(), Error> {
+    let VeriguardCmd::Install(args) = cli.cmd else {
+        unreachable!("dispatcher only routes install args here")
+    };
+    let mut config = install::SystemdConfig::default();
+    if let Some(p) = args.binary_path {
+        config.binary_path = p;
+    }
+    if let Some(p) = args.state_dir {
+        config.state_dir = p;
+    }
+    if let Some(n) = args.service_name {
+        config.service_name = n;
+    }
+    if let Some(u) = args.service_user {
+        config.service_user = u;
+    }
+    config.enable_on_install = !args.no_enable;
+    config.dry_run = args.dry_run;
+
+    let report = install::install_service(&config)
+        .map_err(|e| Error::Internal(format!("install failed: {e}")))?;
+
+    if !report.wrote_unit_file {
+        info!(
+            "install --dry-run: would write {} ({} bytes)",
+            report.unit_path.display(),
+            report.unit_contents.len()
+        );
+    } else {
+        info!(
+            "wrote unit file: {} ({} bytes); enabled={}",
+            report.unit_path.display(),
+            report.unit_contents.len(),
+            report.enabled
+        );
+        if !report.enabled {
+            info!(
+                "re-run `systemctl daemon-reload && systemctl enable --now {}.service` when ready",
+                config.service_name
+            );
+        }
+    }
     Ok(())
 }
 
