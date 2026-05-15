@@ -16,6 +16,13 @@ mod onboard;
 #[allow(dead_code)]
 mod state;
 
+// Veriguard 二开 (C1-Agent-3): Mode C `.vpack` / `.vresults` envelope
+// serdes — wire-compatible with Java VpackSerializer / VresultsSerializer.
+// Consumed by an upcoming `pack` subcommand executor; the API is already
+// plumbed so C1-Integration can cross-language fixture-test against it.
+#[allow(dead_code)]
+mod pack;
+
 mod capabilities;
 mod implant;
 mod transport;
