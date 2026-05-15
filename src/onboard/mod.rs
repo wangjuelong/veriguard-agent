@@ -11,6 +11,7 @@
 pub mod bootstrap;
 pub mod init;
 pub mod install_pack;
+pub mod rotate;
 
 #[allow(unused_imports)]
 pub use bootstrap::{run_bootstrap, BootstrapError};
@@ -18,3 +19,5 @@ pub use bootstrap::{run_bootstrap, BootstrapError};
 pub use init::{default_state_dir, run_init_install_pack, InitError};
 #[allow(unused_imports)]
 pub use install_pack::{load_install_pack, parse_install_pack, InstallPack, InstallPackError};
+#[allow(unused_imports)]
+pub use rotate::{run_rotate_keys, RotateError, RotationReport};

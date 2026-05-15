@@ -16,6 +16,21 @@ mod onboard;
 #[allow(dead_code)]
 mod state;
 
+// Veriguard 二开 (C1-Agent-3): Mode C `.vpack` / `.vresults` envelope
+// serdes — wire-compatible with Java VpackSerializer / VresultsSerializer.
+// Consumed by an upcoming `pack` subcommand executor; the API is already
+// plumbed so C1-Integration can cross-language fixture-test against it.
+#[allow(dead_code)]
+mod pack;
+
+// Veriguard 二开 (C1-Agent-3): service install (A.8.1 Linux systemd; A.8.2
+// launchd / A.8.3 Windows-SCM stubs return clear "not yet implemented").
+// `dead_code` allow is needed because cargo on non-Linux dev hosts sees
+// the Linux-only systemd helpers as unreachable; the test suite still
+// exercises them on every CI run.
+#[allow(dead_code)]
+mod install;
+
 mod capabilities;
 mod implant;
 mod transport;
@@ -139,6 +154,10 @@ fn try_dispatch_subcommand() -> Option<Result<(), Error>> {
     match args[1].as_str() {
         "init" => Some(run_init_cli(VeriguardCli::parse())),
         "run" => Some(run_run_cli(VeriguardCli::parse())),
+        "install" => Some(run_install_cli(VeriguardCli::parse())),
+        "uninstall" => Some(run_uninstall_cli(VeriguardCli::parse())),
+        "rotate-keys" => Some(run_rotate_keys_cli(VeriguardCli::parse())),
+        "pack" => Some(run_pack_cli(VeriguardCli::parse())),
         _ => None,
     }
 }
@@ -160,6 +179,18 @@ enum VeriguardCmd {
     Init(InitArgs),
     /// Mode-A daemon mode: poll the Veriguard platform for tasks and run them.
     Run(RunArgs),
+    /// Install the agent as a system service (Linux systemd in A.8.1).
+    Install(InstallArgs),
+    /// Reverse an install (A.8.4): disable + remove the systemd unit,
+    /// optionally purge the state directory.
+    Uninstall(UninstallArgs),
+    /// Rotate the agent's Ed25519 + X25519 keypairs (A.8.5).  Backs the
+    /// old keys aside and prints new pubs so the operator can re-enroll
+    /// with the platform.
+    RotateKeys(RotateKeysArgs),
+    /// Mode-C offline pack execution: single-pack (A.7.3) or directory
+    /// scan with replay blacklist (A.7.4).
+    Pack(PackArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -207,6 +238,110 @@ struct RunArgs {
     /// Override exponential-backoff cap (seconds).  Defaults to 300s.
     #[arg(long)]
     max_backoff_secs: Option<u64>,
+}
+
+#[derive(clap::Args, Debug)]
+struct PackArgs {
+    /// Path to a single platform-built `.vpack` envelope on disk.
+    /// Mutually exclusive with `--scan-dir`.  Requires `--output`.
+    #[arg(long, conflicts_with = "scan_dir", requires = "output")]
+    input: Option<PathBuf>,
+
+    /// Path the agent-built `.vresults` envelope will be written to
+    /// (single-pack mode only).  Refuses to overwrite an existing file.
+    #[arg(long, requires = "input")]
+    output: Option<PathBuf>,
+
+    /// Directory to scan for `*.vpack` files.  Each file is executed
+    /// serially in lexicographic order; previously-executed packs (by
+    /// `pack_id`) are skipped via the persistent
+    /// `executed-packs.json` blacklist.  Mutually exclusive with
+    /// `--input`.
+    #[arg(long, conflicts_with = "input")]
+    scan_dir: Option<PathBuf>,
+
+    /// Directory to write `.vresults` files into when using
+    /// `--scan-dir`.  Defaults to the scan directory itself (each
+    /// `<x>.vpack` becomes `<x>.vresults` next to it).
+    #[arg(long, requires = "scan_dir")]
+    output_dir: Option<PathBuf>,
+
+    /// State directory containing `install-pack.json`,
+    /// `keys/{sign,enc}.key`, and `executed-packs.json`.  Defaults to
+    /// `~/.veriguard-agent`.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Debug)]
+struct UninstallArgs {
+    /// Systemd unit name (no `.service` suffix).  Defaults to `veriguard-agent`.
+    #[arg(long)]
+    service_name: Option<String>,
+
+    /// State directory that the install pack + agent keys live under.
+    /// Only consulted when `--purge` is also passed.  Defaults to
+    /// `/var/lib/veriguard`.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+
+    /// Skip `systemctl disable --now` (useful when the service was never
+    /// enabled — uninstall still removes the stale unit file).
+    #[arg(long, default_value_t = false)]
+    no_disable: bool,
+
+    /// **DESTRUCTIVE** — recursively delete `--state-dir` after removing
+    /// the service.  Wipes agent keys, install pack, and
+    /// `executed-packs.json`.
+    #[arg(long, default_value_t = false)]
+    purge: bool,
+
+    /// Print the planned actions without touching disk or invoking
+    /// systemctl.
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
+}
+
+#[derive(clap::Args, Debug)]
+struct RotateKeysArgs {
+    /// State directory containing `keys/{sign,enc}.key`.  Defaults to
+    /// `~/.veriguard-agent`.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+
+    /// Print the new public keys without writing anything to disk.
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
+}
+
+#[derive(clap::Args, Debug)]
+struct InstallArgs {
+    /// Path to the agent binary the service unit will exec.  Defaults to
+    /// `/usr/local/bin/veriguard-agent` (matches the one-line curl install).
+    #[arg(long)]
+    binary_path: Option<PathBuf>,
+
+    /// State directory passed to `veriguard-agent run --state-dir`.
+    /// Defaults to `/var/lib/veriguard`.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+
+    /// Systemd unit name (no `.service` suffix).  Defaults to `veriguard-agent`.
+    #[arg(long)]
+    service_name: Option<String>,
+
+    /// Service `User=` (also used for `Group=`).  Defaults to `veriguard`.
+    #[arg(long)]
+    service_user: Option<String>,
+
+    /// Write the unit file but skip `systemctl daemon-reload && enable --now`.
+    #[arg(long, default_value_t = false)]
+    no_enable: bool,
+
+    /// Render the unit file to stdout without writing or running systemctl.
+    /// Useful for pre-prod review or air-gapped operators.
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
 }
 
 fn run_init_cli(cli: VeriguardCli) -> Result<(), Error> {
@@ -315,6 +450,247 @@ fn run_run_cli(cli: VeriguardCli) -> Result<(), Error> {
     poller
         .run(&registry)
         .map_err(|e| Error::Internal(format!("poll loop exited with error: {e}")))?;
+    Ok(())
+}
+
+/// Execute offline `.vpack` workloads.  Two modes:
+///
+/// * `--input <file> --output <file>` — single-pack: verify platform
+///   signature, decrypt, dispatch the task list through the standard
+///   capability registry, and emit one `.vresults`.  Refuses to overwrite
+///   an existing `--output`.
+/// * `--scan-dir <dir> [--output-dir <dir>]` — multi-pack drain:
+///   serially execute every `*.vpack` in `--scan-dir` in lexicographic
+///   order, skipping any pack whose `pack_id` is already recorded in
+///   `state_dir/executed-packs.json` (the persistent replay-prevention
+///   blacklist).  Every attempt is recorded back into the blacklist.
+///
+/// Both modes read the install pack + agent keys from `--state-dir`
+/// (defaults to the same path `init` / `run` use).  The capability
+/// registry is identical to Mode A so online/offline dispatch behaves
+/// identically.
+fn run_pack_cli(cli: VeriguardCli) -> Result<(), Error> {
+    use std::sync::Arc;
+
+    let VeriguardCmd::Pack(args) = cli.cmd else {
+        unreachable!("dispatcher only routes pack args here")
+    };
+    let state_dir = match args.state_dir {
+        Some(p) => p,
+        None => onboard::default_state_dir().ok_or_else(|| {
+            Error::Internal("could not resolve $HOME; pass --state-dir explicitly".to_string())
+        })?,
+    };
+
+    // Both modes need the install pack (for capability wiring) and the
+    // same Registry the Mode-A daemon uses so offline dispatch matches
+    // online behavior exactly.
+    let install_pack = onboard::load_install_pack(&state_dir.join("install-pack.json"))
+        .map_err(|e| Error::Internal(format!("install pack missing or invalid: {e}")))?;
+    let implant_manager = Arc::new(implant::ImplantManager::new(
+        install_pack.platform_url.clone(),
+        state_dir.clone(),
+    ));
+    let mut registry = capabilities::Registry::new();
+    registry.register(Box::new(capabilities::HttpAttackCapability::new()));
+    registry.register(Box::new(
+        capabilities::PcapReplayCapability::with_state_dir(state_dir.join("pcaps")),
+    ));
+    registry.register(Box::new(capabilities::CommandInjectCapability::new(
+        implant_manager.clone(),
+    )));
+    registry.register(Box::new(capabilities::ImplantDropCapability::new(
+        implant_manager,
+    )));
+
+    match (args.input, args.scan_dir) {
+        (Some(input), None) => {
+            // Single-pack mode.  `requires = "output"` on PackArgs::input
+            // means clap rejects the CLI before we get here if --output
+            // is missing, but we still guard explicitly so a future
+            // attribute removal doesn't silently break the contract.
+            let output = args.output.ok_or_else(|| {
+                Error::Internal("--input requires --output (single-pack mode)".to_string())
+            })?;
+            let report = pack::execute_vpack(&input, &output, &state_dir, &registry)
+                .map_err(|e| Error::Internal(format!("pack execution failed: {e}")))?;
+            info!(
+                "pack {} executed: {} task(s) → {} result(s); wrote {} bytes to {}",
+                report.pack_id,
+                report.task_count,
+                report.result_count,
+                report.vresults_bytes_written,
+                output.display()
+            );
+            Ok(())
+        }
+        (None, Some(scan_dir)) => {
+            let opts = pack::ScanOptions {
+                scan_dir: &scan_dir,
+                output_dir: args.output_dir.as_deref(),
+                state_dir: &state_dir,
+                registry: &registry,
+            };
+            let report =
+                pack::scan(opts).map_err(|e| Error::Internal(format!("scan failed: {e}")))?;
+            info!(
+                "scan complete: total={} executed_ok={} executed_failed={} \
+                 skipped_blacklisted={} failed_to_read={}",
+                report.total_found,
+                report.executed_ok,
+                report.executed_failed,
+                report.skipped_blacklisted,
+                report.failed_to_read,
+            );
+            Ok(())
+        }
+        (None, None) => Err(Error::Internal(
+            "pack requires either --input <file> + --output <file>, or --scan-dir <dir>"
+                .to_string(),
+        )),
+        (Some(_), Some(_)) => {
+            // clap `conflicts_with` on PackArgs prevents this combination
+            // from ever reaching here; keep an explicit error in case
+            // the attribute is ever removed.
+            Err(Error::Internal(
+                "--input and --scan-dir are mutually exclusive".to_string(),
+            ))
+        }
+    }
+}
+
+/// Reverse a previous install (A.8.4).  Disables the service, removes
+/// the unit file, runs `daemon-reload`, and optionally purges
+/// `--state-dir`.  Dry-run prints the plan without touching the host.
+fn run_uninstall_cli(cli: VeriguardCli) -> Result<(), Error> {
+    let VeriguardCmd::Uninstall(args) = cli.cmd else {
+        unreachable!("dispatcher only routes uninstall args here")
+    };
+    let mut config = install::SystemdUninstallConfig::default();
+    if let Some(n) = args.service_name {
+        config.service_name = n;
+    }
+    if let Some(p) = args.state_dir {
+        config.state_dir = p;
+    }
+    config.disable_first = !args.no_disable;
+    config.purge_state = args.purge;
+    config.dry_run = args.dry_run;
+
+    let report = install::uninstall_service(&config)
+        .map_err(|e| Error::Internal(format!("uninstall failed: {e}")))?;
+
+    if config.dry_run {
+        info!(
+            "uninstall --dry-run: would target {} (purge={})",
+            report.unit_path.display(),
+            args.purge
+        );
+    } else {
+        info!(
+            "uninstall: unit={} removed={} disabled={} daemon_reloaded={} purged_state={}",
+            report.unit_path.display(),
+            report.removed_unit,
+            report.disabled,
+            report.daemon_reloaded,
+            report.purged_state,
+        );
+        if !report.removed_unit {
+            info!("uninstall: unit file was already absent (idempotent)");
+        }
+    }
+    Ok(())
+}
+
+/// Rotate the agent's local Ed25519 + X25519 keypairs (A.8.5).  Old
+/// keys are renamed to `<name>.bak.<UTC timestamp>`; new pubs are
+/// printed for the operator to re-enroll with the platform.
+fn run_rotate_keys_cli(cli: VeriguardCli) -> Result<(), Error> {
+    let VeriguardCmd::RotateKeys(args) = cli.cmd else {
+        unreachable!("dispatcher only routes rotate-keys args here")
+    };
+    let state_dir = match args.state_dir {
+        Some(p) => p,
+        None => onboard::default_state_dir().ok_or_else(|| {
+            Error::Internal("could not resolve $HOME; pass --state-dir explicitly".to_string())
+        })?,
+    };
+    let report = onboard::run_rotate_keys(&state_dir, args.dry_run)
+        .map_err(|e| Error::Internal(format!("rotate-keys failed: {e}")))?;
+
+    let mode = if report.dry_run { "dry-run" } else { "applied" };
+    info!(
+        "rotate-keys ({mode}): state_dir={} new_sign_pub_b64={} new_enc_pub_b64={}",
+        report.state_dir.display(),
+        report.new_sign_pub_b64,
+        report.new_enc_pub_b64,
+    );
+    if let Some(p) = &report.backed_up_sign_path {
+        info!("rotate-keys: backed up sign.key → {}", p.display());
+    }
+    if let Some(p) = &report.backed_up_enc_path {
+        info!("rotate-keys: backed up enc.key → {}", p.display());
+    }
+    if !report.dry_run {
+        info!(
+            "rotate-keys: IMPORTANT — re-run `veriguard-agent init --bootstrap …` \
+             or hand the new public keys to the platform admin before the next \
+             poll, or Mode A will fail at signature verification."
+        );
+    }
+    Ok(())
+}
+
+/// Render + (optionally) install the systemd unit file for the agent.
+///
+/// On Linux this writes `/etc/systemd/system/<name>.service` and runs
+/// `systemctl daemon-reload && enable --now` unless `--no-enable` or
+/// `--dry-run` is passed.  On macOS / Windows the underlying dispatcher
+/// returns a clear "not yet implemented" error pointing at the future
+/// A.8.2 / A.8.3 commits.
+fn run_install_cli(cli: VeriguardCli) -> Result<(), Error> {
+    let VeriguardCmd::Install(args) = cli.cmd else {
+        unreachable!("dispatcher only routes install args here")
+    };
+    let mut config = install::SystemdConfig::default();
+    if let Some(p) = args.binary_path {
+        config.binary_path = p;
+    }
+    if let Some(p) = args.state_dir {
+        config.state_dir = p;
+    }
+    if let Some(n) = args.service_name {
+        config.service_name = n;
+    }
+    if let Some(u) = args.service_user {
+        config.service_user = u;
+    }
+    config.enable_on_install = !args.no_enable;
+    config.dry_run = args.dry_run;
+
+    let report = install::install_service(&config)
+        .map_err(|e| Error::Internal(format!("install failed: {e}")))?;
+
+    if !report.wrote_unit_file {
+        info!(
+            "install --dry-run: would write {} ({} bytes)",
+            report.unit_path.display(),
+            report.unit_contents.len()
+        );
+    } else {
+        info!(
+            "wrote unit file: {} ({} bytes); enabled={}",
+            report.unit_path.display(),
+            report.unit_contents.len(),
+            report.enabled
+        );
+        if !report.enabled {
+            info!(
+                "re-run `systemctl daemon-reload && systemctl enable --now {}.service` when ready",
+                config.service_name
+            );
+        }
+    }
     Ok(())
 }
 
