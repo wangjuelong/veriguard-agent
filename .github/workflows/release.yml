@@ -1,0 +1,209 @@
+# Veriguard Agent — release binary CI (A.8.6)
+#
+# Builds the 6-binary cross-platform release matrix:
+#
+#   linux  / x86_64   (zigbuild glibc 2.31 — covers CentOS 8+ / 麒麟 V10 / 统信 UOS 1060)
+#   linux  / aarch64  (zigbuild glibc 2.31)
+#   macos  / x86_64   (native on macos-latest)
+#   macos  / aarch64  (native on macos-latest, Apple Silicon)
+#   windows / x86_64  (native on windows-latest, MSVC)
+#   windows / aarch64 (cross on windows-latest, MSVC ARM64 cross tools)
+#
+# Triggers:
+#
+#   * push of `v*` tag         — full build + publish GitHub Release
+#   * workflow_dispatch        — full build, artifact upload only (for platform
+#                                classpath placeholder + manual ad-hoc QA)
+#
+# The platform `AgentInstallScriptApi` (PR #57) expects binaries under
+# `classpath:agents/veriguard-agent/<os>/<arch>/veriguard-agent[.exe]`.
+# Operators drop the artifacts from this workflow into that directory
+# before the platform serves install scripts.
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_notes:
+        description: 'Optional notes appended to release body (only used on tag push)'
+        required: false
+        default: ''
+
+permissions:
+  # Needed for softprops/action-gh-release to publish on tag push.
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  build:
+    name: build ${{ matrix.os }}/${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: x86_64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            zigbuild: true
+            zigbuild_target: x86_64-unknown-linux-gnu.2.31
+            ext: ''
+          - os: linux
+            arch: aarch64
+            runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            zigbuild: true
+            zigbuild_target: aarch64-unknown-linux-gnu.2.31
+            ext: ''
+          - os: macos
+            arch: x86_64
+            runner: macos-latest
+            target: x86_64-apple-darwin
+            zigbuild: false
+            ext: ''
+          - os: macos
+            arch: aarch64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            zigbuild: false
+            ext: ''
+          - os: windows
+            arch: x86_64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            zigbuild: false
+            ext: '.exe'
+          - os: windows
+            arch: aarch64
+            runner: windows-latest
+            target: aarch64-pc-windows-msvc
+            zigbuild: false
+            ext: '.exe'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Distinct cache per target so cross-builds don't clobber each other.
+          key: release-${{ matrix.target }}
+
+      - name: Install zig + cargo-zigbuild (Linux only)
+        if: matrix.zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: zig,cargo-zigbuild
+
+      - name: Build release binary (zigbuild)
+        if: matrix.zigbuild
+        shell: bash
+        env:
+          # Pin glibc minimum to 2.31 so the resulting binary runs on
+          # CentOS 8+ / RHEL 8+ / Ubuntu 22.04+ / 麒麟 V10 / 统信 UOS 1060.
+          ZIGBUILD_TARGET: ${{ matrix.zigbuild_target }}
+        run: |
+          cargo zigbuild --release --target "$ZIGBUILD_TARGET"
+
+      - name: Build release binary (native)
+        if: '!matrix.zigbuild'
+        shell: bash
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Strip + stage artifact (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          SRC_DIR: target/${{ matrix.target }}/release
+          DST_NAME: veriguard-agent_${{ matrix.os }}_${{ matrix.arch }}${{ matrix.ext }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "${SRC_DIR}/veriguard-agent${{ matrix.ext }}" "dist/${DST_NAME}"
+          if [ "${{ matrix.os }}" = "macos" ]; then
+            strip "dist/${DST_NAME}"
+          else
+            # zigbuild output is already stripped by default; this is belt-and-suspenders.
+            strip --strip-all "dist/${DST_NAME}" 2>/dev/null || true
+          fi
+          (cd dist && shasum -a 256 "${DST_NAME}") > "dist/${DST_NAME}.sha256"
+          ls -la dist/
+
+      - name: Stage artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          DST_NAME: veriguard-agent_windows_${{ matrix.arch }}.exe
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $src = "target/${{ matrix.target }}/release/veriguard-agent.exe"
+          $dst = "dist/$env:DST_NAME"
+          Copy-Item $src $dst
+          $hash = (Get-FileHash -Algorithm SHA256 -Path $dst).Hash.ToLower()
+          "$hash  $env:DST_NAME" | Out-File -Encoding ascii "dist/$env:DST_NAME.sha256"
+          Get-ChildItem dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: veriguard-agent_${{ matrix.os }}_${{ matrix.arch }}
+          path: |
+            dist/veriguard-agent_${{ matrix.os }}_${{ matrix.arch }}${{ matrix.ext }}
+            dist/veriguard-agent_${{ matrix.os }}_${{ matrix.arch }}${{ matrix.ext }}.sha256
+          if-no-files-found: error
+          # 90-day retention; releases keep the binaries forever, this is just
+          # for manual download / debug.
+          retention-days: 90
+
+  release:
+    name: publish GitHub Release
+    needs: build
+    # Only publish a release on tag push.  workflow_dispatch runs stop after build.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Flatten + aggregate SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find dist -type f \( -name 'veriguard-agent_*' ! -name '*.sha256' \) \
+            -exec cp {} release/ \;
+          # Aggregate the per-binary sha256 lines into a single SHA256SUMS file.
+          find dist -type f -name '*.sha256' -exec cat {} \; | sort > release/SHA256SUMS
+          echo "--- release/ contents ---"
+          ls -la release/
+          echo "--- SHA256SUMS ---"
+          cat release/SHA256SUMS
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          # Append optional manual notes (workflow_dispatch input is ignored on
+          # tag push, so this is empty in practice — kept for symmetry).
+          body: ${{ github.event.inputs.release_notes }}
+          draft: false
