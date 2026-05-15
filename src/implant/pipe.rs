@@ -128,7 +128,13 @@ mod windows {
     }
 
     /// Placeholder so Drop bounds / impl lookups behave on Windows builds.
-    /// Never instantiated.
+    /// Never instantiated — the surrounding `create()` returns
+    /// `ErrorKind::Unsupported` until C1-Integration lands the
+    /// `CreateNamedPipeW` path. `#[allow(dead_code)]` is required because
+    /// `RUSTFLAGS=-D warnings` (release.yml) would otherwise fail the
+    /// Windows build on a struct that exists by design but has no current
+    /// constructor.
+    #[allow(dead_code)]
     pub struct WindowsNamedPipe {
         _path: PathBuf,
     }
