@@ -292,7 +292,7 @@ pub(super) fn validate_identifier(value: &str, field: &'static str) -> Result<()
     Ok(())
 }
 
-fn validate_absolute(p: &Path, field: &'static str) -> Result<(), InstallError> {
+pub(super) fn validate_absolute(p: &Path, field: &'static str) -> Result<(), InstallError> {
     if !p.is_absolute() {
         return Err(InstallError::PathNotAbsolute {
             field,

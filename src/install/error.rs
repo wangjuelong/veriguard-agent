@@ -78,4 +78,26 @@ pub enum InstallError {
         /// Exit code if available (`None` for signal-terminated).
         code: Option<i32>,
     },
+
+    /// Generic service-management tool failed to spawn (used by macOS
+    /// `launchctl` (A.8.2) and Windows `sc.exe` (A.8.3) so each platform
+    /// gets a self-describing error without one variant per CLI).
+    #[error("failed to spawn {tool}: {err}")]
+    ToolSpawn {
+        /// Short tool name shown in the error message (e.g. `"launchctl"`).
+        tool: &'static str,
+        /// Wrapped `std::io::Error` rendered via `to_string`.
+        err: String,
+    },
+
+    /// Generic service-management tool exited non-zero.
+    #[error("{tool} {args:?} exited non-zero (code: {code:?})")]
+    ToolNonZero {
+        /// Short tool name (e.g. `"launchctl"` / `"sc.exe"`).
+        tool: &'static str,
+        /// Command-line args joined with spaces (no shell quoting required).
+        args: String,
+        /// Exit code if available (`None` for signal-terminated).
+        code: Option<i32>,
+    },
 }
