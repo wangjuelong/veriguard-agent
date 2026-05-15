@@ -1,4 +1,4 @@
-//! `.vpack` / `.vresults` envelope serdes for Mode C offline pack flow (spec § 3.5).
+//! `.vpack` / `.vresults` Mode C offline pack flow (spec § 3.5).
 //!
 //! ## Submodules
 //!
@@ -8,7 +8,13 @@
 //!   Contains the 7-field metadata, build + parse, and round-trip tests.
 //! - [`vresults`] — agent-built, platform-consumed result packs (spec § 3.5.3).
 //!   Contains the 4-field metadata, build + parse, and round-trip tests.
-//! - [`error`] — flat error enum returned by all parse paths.
+//! - [`executor`] — A.7.3 single-pack end-to-end: parse → decrypt →
+//!   dispatch → encrypt → build result.
+//! - [`blacklist`] — A.7.4 persistent replay-prevention store
+//!   (`executed-packs.json`).
+//! - [`scanner`] — A.7.4 multi-pack directory drain with serial
+//!   execution + blacklist gating.
+//! - [`error`] — flat error enum returned by all envelope parse paths.
 //!
 //! ## Cross-language byte contract
 //!
@@ -30,25 +36,33 @@
 //! § 3.5 for the spec and `project_veriguard_wire_contract_locked.md`
 //! for the byte-level invariants pinned during C1-Agent-2 review.
 
+pub mod blacklist;
 pub mod common;
 pub mod error;
 pub mod executor;
+pub mod scanner;
 pub mod vpack;
 pub mod vresults;
 
-// Re-exports for callers.  The `executor` surface (`execute_vpack`,
-// `ExecError`, `ExecuteReport`) is consumed by the `pack` CLI subcommand
-// in `main.rs`; the lower-level envelope APIs remain re-exported with
-// `#[allow(unused_imports)]` because they are not all used by the binary
-// path itself — they are the published surface for C1-Integration
-// cross-language fixture tests and for the upcoming A.7.4 multi-pack
-// directory scanner.
+// Re-exports for callers.  The `executor` + `scanner` surfaces are
+// consumed by the `pack` CLI subcommand in `main.rs`; the lower-level
+// envelope APIs remain re-exported with `#[allow(unused_imports)]`
+// because they are not all used by the binary path itself — they are
+// the published surface for C1-Integration cross-language fixture
+// tests.
+#[allow(unused_imports)]
+pub use blacklist::{
+    append as blacklist_append, load as blacklist_load, save as blacklist_save, BlacklistError,
+    Entry as BlacklistEntry, Outcome as BlacklistOutcome,
+};
 #[allow(unused_imports)]
 pub use common::EncryptedEnvelope;
 #[allow(unused_imports)]
 pub use error::PackError;
 #[allow(unused_imports)]
 pub use executor::{execute_vpack, ExecError, ExecuteReport};
+#[allow(unused_imports)]
+pub use scanner::{scan, ScanError, ScanItem, ScanItemOutcome, ScanOptions, ScanReport};
 #[allow(unused_imports)]
 pub use vpack::{build_vpack, parse_vpack, VpackContents, VpackMetadata, FORMAT_VPACK};
 #[allow(unused_imports)]

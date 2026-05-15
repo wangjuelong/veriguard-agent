@@ -234,17 +234,33 @@ struct RunArgs {
 
 #[derive(clap::Args, Debug)]
 struct PackArgs {
-    /// Path to the platform-built `.vpack` envelope on disk.
-    #[arg(long)]
-    input: PathBuf,
+    /// Path to a single platform-built `.vpack` envelope on disk.
+    /// Mutually exclusive with `--scan-dir`.  Requires `--output`.
+    #[arg(long, conflicts_with = "scan_dir", requires = "output")]
+    input: Option<PathBuf>,
 
-    /// Path the agent-built `.vresults` envelope will be written to.
-    /// Refuses to overwrite an existing file.
-    #[arg(long)]
-    output: PathBuf,
+    /// Path the agent-built `.vresults` envelope will be written to
+    /// (single-pack mode only).  Refuses to overwrite an existing file.
+    #[arg(long, requires = "input")]
+    output: Option<PathBuf>,
 
-    /// State directory containing `install-pack.json` and
-    /// `keys/{sign,enc}.key`.  Defaults to `~/.veriguard-agent`.
+    /// Directory to scan for `*.vpack` files.  Each file is executed
+    /// serially in lexicographic order; previously-executed packs (by
+    /// `pack_id`) are skipped via the persistent
+    /// `executed-packs.json` blacklist.  Mutually exclusive with
+    /// `--input`.
+    #[arg(long, conflicts_with = "input")]
+    scan_dir: Option<PathBuf>,
+
+    /// Directory to write `.vresults` files into when using
+    /// `--scan-dir`.  Defaults to the scan directory itself (each
+    /// `<x>.vpack` becomes `<x>.vresults` next to it).
+    #[arg(long, requires = "scan_dir")]
+    output_dir: Option<PathBuf>,
+
+    /// State directory containing `install-pack.json`,
+    /// `keys/{sign,enc}.key`, and `executed-packs.json`.  Defaults to
+    /// `~/.veriguard-agent`.
     #[arg(long)]
     state_dir: Option<PathBuf>,
 }
@@ -388,13 +404,22 @@ fn run_run_cli(cli: VeriguardCli) -> Result<(), Error> {
     Ok(())
 }
 
-/// Execute a single offline `.vpack`: verify the platform signature, decrypt
-/// the task list, dispatch each task through the standard capability registry,
-/// and emit the matching `.vresults` file.
+/// Execute offline `.vpack` workloads.  Two modes:
 ///
-/// Reads the install pack + agent keys from `--state-dir` (defaults to the
-/// same path `init` / `run` use).  Refuses to overwrite an existing
-/// `--output` so an operator who re-runs the same pack notices.
+/// * `--input <file> --output <file>` — single-pack: verify platform
+///   signature, decrypt, dispatch the task list through the standard
+///   capability registry, and emit one `.vresults`.  Refuses to overwrite
+///   an existing `--output`.
+/// * `--scan-dir <dir> [--output-dir <dir>]` — multi-pack drain:
+///   serially execute every `*.vpack` in `--scan-dir` in lexicographic
+///   order, skipping any pack whose `pack_id` is already recorded in
+///   `state_dir/executed-packs.json` (the persistent replay-prevention
+///   blacklist).  Every attempt is recorded back into the blacklist.
+///
+/// Both modes read the install pack + agent keys from `--state-dir`
+/// (defaults to the same path `init` / `run` use).  The capability
+/// registry is identical to Mode A so online/offline dispatch behaves
+/// identically.
 fn run_pack_cli(cli: VeriguardCli) -> Result<(), Error> {
     use std::sync::Arc;
 
@@ -408,12 +433,13 @@ fn run_pack_cli(cli: VeriguardCli) -> Result<(), Error> {
         })?,
     };
 
-    // Build the same capability registry the Mode-A daemon uses so the
-    // tasks dispatched offline match online behavior exactly.
-    let pack = onboard::load_install_pack(&state_dir.join("install-pack.json"))
+    // Both modes need the install pack (for capability wiring) and the
+    // same Registry the Mode-A daemon uses so offline dispatch matches
+    // online behavior exactly.
+    let install_pack = onboard::load_install_pack(&state_dir.join("install-pack.json"))
         .map_err(|e| Error::Internal(format!("install pack missing or invalid: {e}")))?;
     let implant_manager = Arc::new(implant::ImplantManager::new(
-        pack.platform_url.clone(),
+        install_pack.platform_url.clone(),
         state_dir.clone(),
     ));
     let mut registry = capabilities::Registry::new();
@@ -428,18 +454,60 @@ fn run_pack_cli(cli: VeriguardCli) -> Result<(), Error> {
         implant_manager,
     )));
 
-    let report = pack::execute_vpack(&args.input, &args.output, &state_dir, &registry)
-        .map_err(|e| Error::Internal(format!("pack execution failed: {e}")))?;
-
-    info!(
-        "pack {} executed: {} task(s) → {} result(s); wrote {} bytes to {}",
-        report.pack_id,
-        report.task_count,
-        report.result_count,
-        report.vresults_bytes_written,
-        args.output.display()
-    );
-    Ok(())
+    match (args.input, args.scan_dir) {
+        (Some(input), None) => {
+            // Single-pack mode.  `requires = "output"` on PackArgs::input
+            // means clap rejects the CLI before we get here if --output
+            // is missing, but we still guard explicitly so a future
+            // attribute removal doesn't silently break the contract.
+            let output = args.output.ok_or_else(|| {
+                Error::Internal("--input requires --output (single-pack mode)".to_string())
+            })?;
+            let report = pack::execute_vpack(&input, &output, &state_dir, &registry)
+                .map_err(|e| Error::Internal(format!("pack execution failed: {e}")))?;
+            info!(
+                "pack {} executed: {} task(s) → {} result(s); wrote {} bytes to {}",
+                report.pack_id,
+                report.task_count,
+                report.result_count,
+                report.vresults_bytes_written,
+                output.display()
+            );
+            Ok(())
+        }
+        (None, Some(scan_dir)) => {
+            let opts = pack::ScanOptions {
+                scan_dir: &scan_dir,
+                output_dir: args.output_dir.as_deref(),
+                state_dir: &state_dir,
+                registry: &registry,
+            };
+            let report =
+                pack::scan(opts).map_err(|e| Error::Internal(format!("scan failed: {e}")))?;
+            info!(
+                "scan complete: total={} executed_ok={} executed_failed={} \
+                 skipped_blacklisted={} failed_to_read={}",
+                report.total_found,
+                report.executed_ok,
+                report.executed_failed,
+                report.skipped_blacklisted,
+                report.failed_to_read,
+            );
+            Ok(())
+        }
+        (None, None) => Err(Error::Internal(
+            "pack requires either --input <file> + --output <file>, or --scan-dir <dir>"
+                .to_string(),
+        )),
+        (Some(_), Some(_)) => {
+            // clap `conflicts_with` on PackArgs prevents this combination
+            // from ever reaching here; keep an explicit error in case
+            // the attribute is ever removed.
+            Err(Error::Internal(
+                "--input and --scan-dir are mutually exclusive".to_string(),
+            ))
+        }
+    }
 }
 
 /// Render + (optionally) install the systemd unit file for the agent.
