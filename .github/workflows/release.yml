@@ -103,11 +103,20 @@ jobs:
           # Distinct cache per target so cross-builds don't clobber each other.
           key: release-${{ matrix.target }}
 
-      - name: Install zig + cargo-zigbuild (Linux only)
+      # `taiki-e/install-action` does not support `zig` (it is a standalone
+      # toolchain, not a crates.io package). Install zig via the dedicated
+      # community action and cargo-zigbuild via install-action.
+      - name: Install zig (Linux only)
+        if: matrix.zigbuild
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.0
+
+      - name: Install cargo-zigbuild (Linux only)
         if: matrix.zigbuild
         uses: taiki-e/install-action@v2
         with:
-          tool: zig,cargo-zigbuild
+          tool: cargo-zigbuild
 
       - name: Build release binary (zigbuild)
         if: matrix.zigbuild
