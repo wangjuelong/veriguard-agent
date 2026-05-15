@@ -271,7 +271,10 @@ fn systemctl_enable_now(service_name: &str) -> Result<(), InstallError> {
 
 /// Reject any character outside `[A-Za-z0-9_-]` so identifier values
 /// cannot smuggle a `\n` or `=` into the unit file.
-fn validate_identifier(value: &str, field: &'static str) -> Result<(), InstallError> {
+///
+/// `pub(super)` so [`super::uninstall`] (A.8.4) can reuse the exact same
+/// hardening check on its own `service_name` field.
+pub(super) fn validate_identifier(value: &str, field: &'static str) -> Result<(), InstallError> {
     if value.is_empty() {
         return Err(InstallError::EmptyField(field));
     }

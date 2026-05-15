@@ -155,6 +155,8 @@ fn try_dispatch_subcommand() -> Option<Result<(), Error>> {
         "init" => Some(run_init_cli(VeriguardCli::parse())),
         "run" => Some(run_run_cli(VeriguardCli::parse())),
         "install" => Some(run_install_cli(VeriguardCli::parse())),
+        "uninstall" => Some(run_uninstall_cli(VeriguardCli::parse())),
+        "rotate-keys" => Some(run_rotate_keys_cli(VeriguardCli::parse())),
         "pack" => Some(run_pack_cli(VeriguardCli::parse())),
         _ => None,
     }
@@ -179,9 +181,15 @@ enum VeriguardCmd {
     Run(RunArgs),
     /// Install the agent as a system service (Linux systemd in A.8.1).
     Install(InstallArgs),
-    /// Mode-C offline pack execution: consume a `.vpack`, run its tasks
-    /// locally, and emit the matching `.vresults` (A.7.3 single-pack;
-    /// directory scan + replay blacklist land in A.7.4).
+    /// Reverse an install (A.8.4): disable + remove the systemd unit,
+    /// optionally purge the state directory.
+    Uninstall(UninstallArgs),
+    /// Rotate the agent's Ed25519 + X25519 keypairs (A.8.5).  Backs the
+    /// old keys aside and prints new pubs so the operator can re-enroll
+    /// with the platform.
+    RotateKeys(RotateKeysArgs),
+    /// Mode-C offline pack execution: single-pack (A.7.3) or directory
+    /// scan with replay blacklist (A.7.4).
     Pack(PackArgs),
 }
 
@@ -263,6 +271,47 @@ struct PackArgs {
     /// `~/.veriguard-agent`.
     #[arg(long)]
     state_dir: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Debug)]
+struct UninstallArgs {
+    /// Systemd unit name (no `.service` suffix).  Defaults to `veriguard-agent`.
+    #[arg(long)]
+    service_name: Option<String>,
+
+    /// State directory that the install pack + agent keys live under.
+    /// Only consulted when `--purge` is also passed.  Defaults to
+    /// `/var/lib/veriguard`.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+
+    /// Skip `systemctl disable --now` (useful when the service was never
+    /// enabled — uninstall still removes the stale unit file).
+    #[arg(long, default_value_t = false)]
+    no_disable: bool,
+
+    /// **DESTRUCTIVE** — recursively delete `--state-dir` after removing
+    /// the service.  Wipes agent keys, install pack, and
+    /// `executed-packs.json`.
+    #[arg(long, default_value_t = false)]
+    purge: bool,
+
+    /// Print the planned actions without touching disk or invoking
+    /// systemctl.
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
+}
+
+#[derive(clap::Args, Debug)]
+struct RotateKeysArgs {
+    /// State directory containing `keys/{sign,enc}.key`.  Defaults to
+    /// `~/.veriguard-agent`.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+
+    /// Print the new public keys without writing anything to disk.
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -508,6 +557,88 @@ fn run_pack_cli(cli: VeriguardCli) -> Result<(), Error> {
             ))
         }
     }
+}
+
+/// Reverse a previous install (A.8.4).  Disables the service, removes
+/// the unit file, runs `daemon-reload`, and optionally purges
+/// `--state-dir`.  Dry-run prints the plan without touching the host.
+fn run_uninstall_cli(cli: VeriguardCli) -> Result<(), Error> {
+    let VeriguardCmd::Uninstall(args) = cli.cmd else {
+        unreachable!("dispatcher only routes uninstall args here")
+    };
+    let mut config = install::SystemdUninstallConfig::default();
+    if let Some(n) = args.service_name {
+        config.service_name = n;
+    }
+    if let Some(p) = args.state_dir {
+        config.state_dir = p;
+    }
+    config.disable_first = !args.no_disable;
+    config.purge_state = args.purge;
+    config.dry_run = args.dry_run;
+
+    let report = install::uninstall_service(&config)
+        .map_err(|e| Error::Internal(format!("uninstall failed: {e}")))?;
+
+    if config.dry_run {
+        info!(
+            "uninstall --dry-run: would target {} (purge={})",
+            report.unit_path.display(),
+            args.purge
+        );
+    } else {
+        info!(
+            "uninstall: unit={} removed={} disabled={} daemon_reloaded={} purged_state={}",
+            report.unit_path.display(),
+            report.removed_unit,
+            report.disabled,
+            report.daemon_reloaded,
+            report.purged_state,
+        );
+        if !report.removed_unit {
+            info!("uninstall: unit file was already absent (idempotent)");
+        }
+    }
+    Ok(())
+}
+
+/// Rotate the agent's local Ed25519 + X25519 keypairs (A.8.5).  Old
+/// keys are renamed to `<name>.bak.<UTC timestamp>`; new pubs are
+/// printed for the operator to re-enroll with the platform.
+fn run_rotate_keys_cli(cli: VeriguardCli) -> Result<(), Error> {
+    let VeriguardCmd::RotateKeys(args) = cli.cmd else {
+        unreachable!("dispatcher only routes rotate-keys args here")
+    };
+    let state_dir = match args.state_dir {
+        Some(p) => p,
+        None => onboard::default_state_dir().ok_or_else(|| {
+            Error::Internal("could not resolve $HOME; pass --state-dir explicitly".to_string())
+        })?,
+    };
+    let report = onboard::run_rotate_keys(&state_dir, args.dry_run)
+        .map_err(|e| Error::Internal(format!("rotate-keys failed: {e}")))?;
+
+    let mode = if report.dry_run { "dry-run" } else { "applied" };
+    info!(
+        "rotate-keys ({mode}): state_dir={} new_sign_pub_b64={} new_enc_pub_b64={}",
+        report.state_dir.display(),
+        report.new_sign_pub_b64,
+        report.new_enc_pub_b64,
+    );
+    if let Some(p) = &report.backed_up_sign_path {
+        info!("rotate-keys: backed up sign.key → {}", p.display());
+    }
+    if let Some(p) = &report.backed_up_enc_path {
+        info!("rotate-keys: backed up enc.key → {}", p.display());
+    }
+    if !report.dry_run {
+        info!(
+            "rotate-keys: IMPORTANT — re-run `veriguard-agent init --bootstrap …` \
+             or hand the new public keys to the platform admin before the next \
+             poll, or Mode A will fail at signature verification."
+        );
+    }
+    Ok(())
 }
 
 /// Render + (optionally) install the systemd unit file for the agent.
