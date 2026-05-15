@@ -155,6 +155,7 @@ fn try_dispatch_subcommand() -> Option<Result<(), Error>> {
         "init" => Some(run_init_cli(VeriguardCli::parse())),
         "run" => Some(run_run_cli(VeriguardCli::parse())),
         "install" => Some(run_install_cli(VeriguardCli::parse())),
+        "pack" => Some(run_pack_cli(VeriguardCli::parse())),
         _ => None,
     }
 }
@@ -178,6 +179,10 @@ enum VeriguardCmd {
     Run(RunArgs),
     /// Install the agent as a system service (Linux systemd in A.8.1).
     Install(InstallArgs),
+    /// Mode-C offline pack execution: consume a `.vpack`, run its tasks
+    /// locally, and emit the matching `.vresults` (A.7.3 single-pack;
+    /// directory scan + replay blacklist land in A.7.4).
+    Pack(PackArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -225,6 +230,23 @@ struct RunArgs {
     /// Override exponential-backoff cap (seconds).  Defaults to 300s.
     #[arg(long)]
     max_backoff_secs: Option<u64>,
+}
+
+#[derive(clap::Args, Debug)]
+struct PackArgs {
+    /// Path to the platform-built `.vpack` envelope on disk.
+    #[arg(long)]
+    input: PathBuf,
+
+    /// Path the agent-built `.vresults` envelope will be written to.
+    /// Refuses to overwrite an existing file.
+    #[arg(long)]
+    output: PathBuf,
+
+    /// State directory containing `install-pack.json` and
+    /// `keys/{sign,enc}.key`.  Defaults to `~/.veriguard-agent`.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -363,6 +385,60 @@ fn run_run_cli(cli: VeriguardCli) -> Result<(), Error> {
     poller
         .run(&registry)
         .map_err(|e| Error::Internal(format!("poll loop exited with error: {e}")))?;
+    Ok(())
+}
+
+/// Execute a single offline `.vpack`: verify the platform signature, decrypt
+/// the task list, dispatch each task through the standard capability registry,
+/// and emit the matching `.vresults` file.
+///
+/// Reads the install pack + agent keys from `--state-dir` (defaults to the
+/// same path `init` / `run` use).  Refuses to overwrite an existing
+/// `--output` so an operator who re-runs the same pack notices.
+fn run_pack_cli(cli: VeriguardCli) -> Result<(), Error> {
+    use std::sync::Arc;
+
+    let VeriguardCmd::Pack(args) = cli.cmd else {
+        unreachable!("dispatcher only routes pack args here")
+    };
+    let state_dir = match args.state_dir {
+        Some(p) => p,
+        None => onboard::default_state_dir().ok_or_else(|| {
+            Error::Internal("could not resolve $HOME; pass --state-dir explicitly".to_string())
+        })?,
+    };
+
+    // Build the same capability registry the Mode-A daemon uses so the
+    // tasks dispatched offline match online behavior exactly.
+    let pack = onboard::load_install_pack(&state_dir.join("install-pack.json"))
+        .map_err(|e| Error::Internal(format!("install pack missing or invalid: {e}")))?;
+    let implant_manager = Arc::new(implant::ImplantManager::new(
+        pack.platform_url.clone(),
+        state_dir.clone(),
+    ));
+    let mut registry = capabilities::Registry::new();
+    registry.register(Box::new(capabilities::HttpAttackCapability::new()));
+    registry.register(Box::new(
+        capabilities::PcapReplayCapability::with_state_dir(state_dir.join("pcaps")),
+    ));
+    registry.register(Box::new(capabilities::CommandInjectCapability::new(
+        implant_manager.clone(),
+    )));
+    registry.register(Box::new(capabilities::ImplantDropCapability::new(
+        implant_manager,
+    )));
+
+    let report = pack::execute_vpack(&args.input, &args.output, &state_dir, &registry)
+        .map_err(|e| Error::Internal(format!("pack execution failed: {e}")))?;
+
+    info!(
+        "pack {} executed: {} task(s) → {} result(s); wrote {} bytes to {}",
+        report.pack_id,
+        report.task_count,
+        report.result_count,
+        report.vresults_bytes_written,
+        args.output.display()
+    );
     Ok(())
 }
 

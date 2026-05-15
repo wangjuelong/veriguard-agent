@@ -32,18 +32,23 @@
 
 pub mod common;
 pub mod error;
+pub mod executor;
 pub mod vpack;
 pub mod vresults;
 
-// Re-exports for callers — `#[allow(unused_imports)]` because the
-// binary `veriguard-agent` doesn't consume the `pack` API yet (the
-// `pack` subcommand executor lands in a follow-up PR).  The tests in
-// each submodule do exercise the API; this re-export is the published
-// surface for C1-Integration cross-language fixture tests.
+// Re-exports for callers.  The `executor` surface (`execute_vpack`,
+// `ExecError`, `ExecuteReport`) is consumed by the `pack` CLI subcommand
+// in `main.rs`; the lower-level envelope APIs remain re-exported with
+// `#[allow(unused_imports)]` because they are not all used by the binary
+// path itself — they are the published surface for C1-Integration
+// cross-language fixture tests and for the upcoming A.7.4 multi-pack
+// directory scanner.
 #[allow(unused_imports)]
 pub use common::EncryptedEnvelope;
 #[allow(unused_imports)]
 pub use error::PackError;
+#[allow(unused_imports)]
+pub use executor::{execute_vpack, ExecError, ExecuteReport};
 #[allow(unused_imports)]
 pub use vpack::{build_vpack, parse_vpack, VpackContents, VpackMetadata, FORMAT_VPACK};
 #[allow(unused_imports)]
