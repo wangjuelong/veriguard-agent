@@ -715,6 +715,62 @@ exit 0
         }
     }
 
+    /// §4.4 sanity check —— ImplantManager 对 payload bytes 是 schema-agnostic 的，
+    /// 任何 platform/implant 升级 NetworkTrafficPayload schema (例如本会话加的
+    /// `extra_tuples`) 都不该让 agent 端代码动；payload_b64 字节流必须原封不动透传给
+    /// 实际负责解析的 implant 子进程。
+    ///
+    /// 本测试构造一个包含 `extra_tuples` 的 NetworkTraffic JSON，base64 编码后送进
+    /// run_implant；mock implant 捕获 argv 后断言：agent 给的 --payload-b64 与原始
+    /// 字符串字节级相等，未发生任何中间解析 / 重写。
+    ///
+    /// **重要不变量**：如果未来有人在 ImplantManager 里加 payload sniff / 字段过滤逻辑
+    /// 让这个测试挂掉 —— 那是回归，请回退该改动而非改测试。schema 演化的所有逻辑都应在
+    /// implant 仓而非 agent 仓。
+    #[test]
+    fn test_implant_payload_b64_is_opaque_to_agent_for_multi_tuple_schema() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let dir = tempdir().unwrap();
+        let bin = write_mock_implant(dir.path(), 0, "SUCCESS");
+        let m = manager_with_mock(dir.path(), bin);
+
+        // NetworkTraffic JSON with §4.4 extra_tuples list. Agent should treat
+        // this entire string as opaque bytes — no introspection, no rewriting.
+        let payload_json = concat!(
+            "{",
+            "\"protocol\":\"tcp\",",
+            "\"target\":\"2001:db8::2\",",
+            "\"port\":443,",
+            "\"timeout_secs\":5,",
+            "\"extra_tuples\":[",
+            "{\"protocol\":\"tcp\",\"target\":\"2001:db8::2\",\"port\":8080},",
+            "{\"protocol\":\"udp\",\"target\":\"2001:db8::4\",\"port\":53}",
+            "]}"
+        );
+        let payload_b64 = STANDARD.encode(payload_json.as_bytes());
+
+        m.run_implant("task-multi-tuple", "NetworkTraffic", &payload_b64, 5)
+            .expect("ok");
+
+        let argv = std::fs::read_to_string(dir.path().join("argv.txt")).unwrap();
+        assert!(
+            argv.contains("--payload-type NetworkTraffic"),
+            "payload_type must reach implant verbatim: {argv}"
+        );
+        assert!(
+            argv.contains(&payload_b64),
+            "payload_b64 must reach implant byte-identical (no agent-side rewrite): \
+             expected {payload_b64}, argv = {argv}"
+        );
+
+        // Defensive: agent must NOT have decoded the JSON to expose multi-tuple
+        // fields as separate flags. extra-tuples / multi-tuple are not flag names.
+        assert!(
+            !argv.contains("--extra-tuples") && !argv.contains("--multi-tuple"),
+            "agent leaked schema details into CLI flags: {argv}"
+        );
+    }
+
     #[test]
     fn test_implant_download_persists_with_0700_perm() {
         let mut server = mockito::Server::new();
