@@ -31,6 +31,7 @@ mod pack;
 #[allow(dead_code)]
 mod install;
 
+mod attribution;
 mod capabilities;
 mod implant;
 mod transport;
@@ -418,8 +419,19 @@ fn run_run_cli(cli: VeriguardCli) -> Result<(), Error> {
         platform_url.clone(),
         state_dir.clone(),
     ));
+    // spec §四 L1 强归因 Ed25519 attribution signer —— 启动时一次性从 env 加载.
+    // 未配置 → `None`，HttpAttackCapability 跳过 sig 注入（兼容旧栈）.
+    // 解码失败 → 启动早早失败.
+    let attribution_signer = attribution::AttributionSigner::from_env()
+        .map_err(|e| Error::Internal(format!("attribution signer init failed: {e}")))?
+        .map(Arc::new);
+
     let mut registry = capabilities::Registry::new();
-    registry.register(Box::new(capabilities::HttpAttackCapability::new()));
+    let mut http_attack = capabilities::HttpAttackCapability::new();
+    if let Some(signer) = &attribution_signer {
+        http_attack = http_attack.with_attribution_signer(signer.clone());
+    }
+    registry.register(Box::new(http_attack));
     registry.register(Box::new(
         capabilities::PcapReplayCapability::with_state_dir(state_dir.join("pcaps")),
     ));
@@ -433,7 +445,8 @@ fn run_run_cli(cli: VeriguardCli) -> Result<(), Error> {
 
     info!(
         "veriguard-agent run: agent_id={agent_id:?} platform_url={platform_url:?} \
-         capabilities={advertised:?}"
+         capabilities={advertised:?} attribution_signer={}",
+        attribution_signer.is_some()
     );
 
     let poller = transport::Poller {
@@ -491,8 +504,17 @@ fn run_pack_cli(cli: VeriguardCli) -> Result<(), Error> {
         install_pack.platform_url.clone(),
         state_dir.clone(),
     ));
+    // Mode C 同 Mode A：加载可选 attribution signer 让离线 dispatch 也注 sig.
+    let attribution_signer = attribution::AttributionSigner::from_env()
+        .map_err(|e| Error::Internal(format!("attribution signer init failed: {e}")))?
+        .map(Arc::new);
+
     let mut registry = capabilities::Registry::new();
-    registry.register(Box::new(capabilities::HttpAttackCapability::new()));
+    let mut http_attack = capabilities::HttpAttackCapability::new();
+    if let Some(signer) = &attribution_signer {
+        http_attack = http_attack.with_attribution_signer(signer.clone());
+    }
+    registry.register(Box::new(http_attack));
     registry.register(Box::new(
         capabilities::PcapReplayCapability::with_state_dir(state_dir.join("pcaps")),
     ));

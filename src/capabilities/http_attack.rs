@@ -29,27 +29,41 @@
 //! ```
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use serde::Deserialize;
 
+use crate::attribution::{AttributionSigner, SignaturePayload};
 use crate::transport::poll::{Task, TaskResult};
 
 use super::Capability;
+
+/// HTTP header names used for Veriguard L1 强归因 markers (spec §3.1.3 + §四 归因决策表).
+/// 平台 PR #82 把 Run-Id / Node-Id / Inject-Id 三件套注入 `WebAttackContent.headers` JSON.
+/// 本 capability 读出 Run-Id / Inject-Id 后追加 Timestamp + Sig 两个 header.
+const HEADER_RUN_ID: &str = "X-Veriguard-Run-Id";
+const HEADER_INJECT_ID: &str = "X-Veriguard-Inject-Id";
+const HEADER_TIMESTAMP: &str = "X-Veriguard-Timestamp";
+const HEADER_SIG: &str = "X-Veriguard-Sig";
 
 /// Boundary HTTP attack capability — sends a pre-crafted HTTP request from
 /// the agent and compares the response against operator expectations.
 pub struct HttpAttackCapability {
     client: reqwest::blocking::Client,
+    /// 可选 Ed25519 attribution 签名器（spec §5.2 决策"档 0 + 平台侧验签"）.
+    /// `None` → 不注 X-Veriguard-Sig / X-Veriguard-Timestamp（platform verifier
+    /// 落 `unsigned` evidence，attribution 仍保留 strong/1.00；兼容旧栈）.
+    attribution_signer: Option<Arc<AttributionSigner>>,
 }
 
 impl HttpAttackCapability {
     /// Stable capability name used in `Task.capability`.
     pub const NAME: &'static str = "http_attack";
 
-    /// Construct a capability with the default HTTP client.
+    /// Construct a capability with the default HTTP client and no attribution signer.
     pub fn new() -> Self {
         Self::with_client(
             reqwest::blocking::Client::builder()
@@ -62,7 +76,20 @@ impl HttpAttackCapability {
     /// Construct a capability with a caller-supplied client (used by tests
     /// that need to override timeout / proxy / TLS behaviour).
     pub fn with_client(client: reqwest::blocking::Client) -> Self {
-        Self { client }
+        Self {
+            client,
+            attribution_signer: None,
+        }
+    }
+
+    /// Attach an Ed25519 attribution signer (spec §四 L1 强归因).  When set,
+    /// every outbound HTTP request that already carries `X-Veriguard-Run-Id`
+    /// + `X-Veriguard-Inject-Id` (从 platform PR #82 注入 `payload.headers`)
+    /// 会再追加 `X-Veriguard-Timestamp` + `X-Veriguard-Sig` —— SIEM 抓回后
+    /// platform verifier (`Veriguard` PR #83) 用预置公钥验签 → STRONG / 1.00.
+    pub fn with_attribution_signer(mut self, signer: Arc<AttributionSigner>) -> Self {
+        self.attribution_signer = Some(signer);
+        self
     }
 }
 
@@ -111,6 +138,11 @@ impl Capability for HttpAttackCapability {
         for (k, v) in &payload.headers {
             request = request.header(k, v);
         }
+        // spec §四 L1 强归因 sig 注入：platform PR #82 已把 Run-Id / Inject-Id 注入
+        // payload.headers；本 capability 读出后用 Ed25519 priv key 签 → 追加 2 个
+        // header (Timestamp + Sig) 到出站 HTTP 请求.
+        request = inject_attribution_headers(request, &payload.headers, &self.attribution_signer);
+
         if let Some(b64) = &payload.body_b64 {
             match B64.decode(b64) {
                 Ok(bytes) => request = request.body(bytes),
@@ -213,6 +245,49 @@ fn truncate(s: &str, max: usize) -> String {
         }
         format!("{}...", &s[..cut])
     }
+}
+
+/// Append Veriguard L1 attribution headers (Timestamp + Sig) to the request
+/// when the prerequisites are met: signer configured AND payload headers
+/// already include both `X-Veriguard-Run-Id` and `X-Veriguard-Inject-Id`
+/// (platform PR #82 注入语义).
+///
+/// 任一缺失 → 透传 request 不动；platform verifier 落 `unsigned` 兼容路径.
+/// Header lookup 大小写不敏感（HTTP header 名通常 case-insensitive；
+/// payload.headers 来自 JSON map 故按字符串保留原 casing —— 比对时统一 lower）.
+fn inject_attribution_headers(
+    request: reqwest::blocking::RequestBuilder,
+    payload_headers: &HashMap<String, String>,
+    signer: &Option<Arc<AttributionSigner>>,
+) -> reqwest::blocking::RequestBuilder {
+    let Some(signer) = signer.as_ref() else {
+        return request;
+    };
+    let Some(run_id) = lookup_header(payload_headers, HEADER_RUN_ID) else {
+        return request;
+    };
+    let Some(inject_id) = lookup_header(payload_headers, HEADER_INJECT_ID) else {
+        return request;
+    };
+    let epoch_ms = chrono::Utc::now().timestamp_millis();
+    let sig_payload = SignaturePayload {
+        run_id: &run_id,
+        inject_id: &inject_id,
+        epoch_ms,
+    };
+    let sig_b64 = signer.sign_base64(&sig_payload);
+    request
+        .header(HEADER_TIMESTAMP, epoch_ms.to_string())
+        .header(HEADER_SIG, sig_b64)
+}
+
+/// Case-insensitive lookup over a JSON-derived header map.
+fn lookup_header(headers: &HashMap<String, String>, name: &str) -> Option<String> {
+    let target = name.to_ascii_lowercase();
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(&target))
+        .map(|(_, v)| v.clone())
 }
 
 fn rfc3339_now() -> String {
@@ -440,4 +515,113 @@ mod tests {
         assert!(s.ends_with('Z'));
         assert!(&s[4..5] == "-");
     }
+
+    // ---- spec §四 L1 强归因 sig 注入 e2e ----
+
+    fn rfc8032_test1_seed_b64() -> String {
+        let hex = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        B64.encode(&bytes)
+    }
+
+    #[test]
+    fn test_http_attack_attaches_sig_when_signer_and_ids_present() {
+        let mut server = Server::new();
+        // mockito `match_header(name, Matcher::Regex(...))` 断言出站请求的
+        // X-Veriguard-Sig / X-Veriguard-Timestamp 真注入.
+        let m = server
+            .mock("GET", "/probe")
+            .match_header("X-Veriguard-Run-Id", "RUN-1")
+            .match_header("X-Veriguard-Inject-Id", "INJ-1")
+            .match_header(
+                "X-Veriguard-Timestamp",
+                mockito::Matcher::Regex(r"^\d+$".to_string()),
+            )
+            .match_header(
+                "X-Veriguard-Sig",
+                mockito::Matcher::Regex(r"^[A-Za-z0-9+/]{86,88}={0,2}$".to_string()),
+            )
+            .with_status(200)
+            .create();
+
+        let signer =
+            Arc::new(AttributionSigner::from_base64(&rfc8032_test1_seed_b64()).unwrap());
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("client");
+        let cap = HttpAttackCapability::with_client(client).with_attribution_signer(signer);
+
+        let payload = serde_json::json!({
+            "method": "GET",
+            "url": format!("{}/probe", server.url()),
+            "headers": {
+                "X-Veriguard-Run-Id": "RUN-1",
+                "X-Veriguard-Inject-Id": "INJ-1",
+            },
+            "expected_status_codes": [200],
+        });
+        let result = cap.execute(&task_with_payload(&payload.to_string()));
+        m.assert();
+        assert_eq!(result.status, "SUCCESS");
+    }
+
+    #[test]
+    fn test_http_attack_skips_sig_when_signer_absent() {
+        // 没配 signer → 不注 Timestamp / Sig（兼容旧栈；platform 落 `unsigned`）.
+        let mut server = Server::new();
+        let m = server
+            .mock("GET", "/probe")
+            .match_header("X-Veriguard-Run-Id", "RUN-1")
+            .match_header("X-Veriguard-Sig", mockito::Matcher::Missing)
+            .match_header("X-Veriguard-Timestamp", mockito::Matcher::Missing)
+            .with_status(200)
+            .create();
+
+        let cap = build_test_capability(); // 无 signer
+        let payload = serde_json::json!({
+            "method": "GET",
+            "url": format!("{}/probe", server.url()),
+            "headers": { "X-Veriguard-Run-Id": "RUN-1", "X-Veriguard-Inject-Id": "INJ-1" },
+            "expected_status_codes": [200],
+        });
+        let result = cap.execute(&task_with_payload(&payload.to_string()));
+        m.assert();
+        assert_eq!(result.status, "SUCCESS");
+    }
+
+    #[test]
+    fn test_http_attack_skips_sig_when_no_run_id_header() {
+        // 有 signer 但 payload.headers 没 Run-Id → 不注 Sig（兼容旧 platform 未升级场景）.
+        let mut server = Server::new();
+        let m = server
+            .mock("GET", "/probe")
+            .match_header("X-Veriguard-Sig", mockito::Matcher::Missing)
+            .with_status(200)
+            .create();
+
+        let signer =
+            Arc::new(AttributionSigner::from_base64(&rfc8032_test1_seed_b64()).unwrap());
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("client");
+        let cap = HttpAttackCapability::with_client(client).with_attribution_signer(signer);
+
+        let payload = serde_json::json!({
+            "method": "GET",
+            "url": format!("{}/probe", server.url()),
+            "headers": {}, // 故意空 —— platform 没注 X-Veriguard-* 三件套
+            "expected_status_codes": [200],
+        });
+        let result = cap.execute(&task_with_payload(&payload.to_string()));
+        m.assert();
+        assert_eq!(result.status, "SUCCESS");
+    }
+
 }
