@@ -34,6 +34,7 @@ mod install;
 mod attribution;
 mod capabilities;
 mod implant;
+mod target;
 mod transport;
 
 #[cfg(test)]
@@ -425,11 +426,19 @@ fn run_run_cli(cli: VeriguardCli) -> Result<(), Error> {
     let attribution_signer = attribution::AttributionSigner::from_env()
         .map_err(|e| Error::Internal(format!("attribution signer init failed: {e}")))?
         .map(Arc::new);
+    // 招标 §3.5 / §6.1 allowed-cidr pre-flight policy (C-2 双层防御 agent 侧)；
+    // env `VERIGUARD_TARGET_ALLOWED_CIDR` 未配 → `None`，HttpAttackCapability 跳过校验.
+    let allowed_cidr_policy = target::AllowedCidrPolicy::from_env()
+        .map_err(|e| Error::Internal(format!("allowed-cidr policy init failed: {e}")))?
+        .map(Arc::new);
 
     let mut registry = capabilities::Registry::new();
     let mut http_attack = capabilities::HttpAttackCapability::new();
     if let Some(signer) = &attribution_signer {
         http_attack = http_attack.with_attribution_signer(signer.clone());
+    }
+    if let Some(policy) = &allowed_cidr_policy {
+        http_attack = http_attack.with_allowed_cidr_policy(policy.clone());
     }
     registry.register(Box::new(http_attack));
     registry.register(Box::new(
@@ -445,8 +454,12 @@ fn run_run_cli(cli: VeriguardCli) -> Result<(), Error> {
 
     info!(
         "veriguard-agent run: agent_id={agent_id:?} platform_url={platform_url:?} \
-         capabilities={advertised:?} attribution_signer={}",
-        attribution_signer.is_some()
+         capabilities={advertised:?} attribution_signer={} allowed_cidr={}",
+        attribution_signer.is_some(),
+        allowed_cidr_policy
+            .as_ref()
+            .map(|p| p.allowed_cidrs().len())
+            .unwrap_or(0)
     );
 
     let poller = transport::Poller {
@@ -508,11 +521,18 @@ fn run_pack_cli(cli: VeriguardCli) -> Result<(), Error> {
     let attribution_signer = attribution::AttributionSigner::from_env()
         .map_err(|e| Error::Internal(format!("attribution signer init failed: {e}")))?
         .map(Arc::new);
+    // Mode C 同 Mode A：加载可选 allowed-cidr policy 让离线 dispatch 也 pre-flight.
+    let allowed_cidr_policy = target::AllowedCidrPolicy::from_env()
+        .map_err(|e| Error::Internal(format!("allowed-cidr policy init failed: {e}")))?
+        .map(Arc::new);
 
     let mut registry = capabilities::Registry::new();
     let mut http_attack = capabilities::HttpAttackCapability::new();
     if let Some(signer) = &attribution_signer {
         http_attack = http_attack.with_attribution_signer(signer.clone());
+    }
+    if let Some(policy) = &allowed_cidr_policy {
+        http_attack = http_attack.with_allowed_cidr_policy(policy.clone());
     }
     registry.register(Box::new(http_attack));
     registry.register(Box::new(
