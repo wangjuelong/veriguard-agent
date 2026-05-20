@@ -90,10 +90,10 @@ impl HttpAttackCapability {
     }
 
     /// Attach an Ed25519 attribution signer (spec §四 L1 强归因).  When set,
-    /// every outbound HTTP request that already carries `X-Veriguard-Run-Id`
-    /// + `X-Veriguard-Inject-Id` (从 platform PR #82 注入 `payload.headers`)
-    /// 会再追加 `X-Veriguard-Timestamp` + `X-Veriguard-Sig` —— SIEM 抓回后
-    /// platform verifier (`Veriguard` PR #83) 用预置公钥验签 → STRONG / 1.00.
+    /// every outbound HTTP request that already carries both
+    /// `X-Veriguard-Run-Id` and `X-Veriguard-Inject-Id` (从 platform PR #82 注入
+    /// `payload.headers`) 会再追加 `X-Veriguard-Timestamp` + `X-Veriguard-Sig`
+    /// —— SIEM 抓回后 platform verifier (`Veriguard` PR #83) 用预置公钥验签 → STRONG / 1.00.
     pub fn with_attribution_signer(mut self, signer: Arc<AttributionSigner>) -> Self {
         self.attribution_signer = Some(signer);
         self
