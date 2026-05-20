@@ -37,6 +37,7 @@ use base64::Engine as _;
 use serde::Deserialize;
 
 use crate::attribution::{AttributionSigner, SignaturePayload};
+use crate::target::{AllowedCidrPolicy, Outcome as CidrOutcome};
 use crate::transport::poll::{Task, TaskResult};
 
 use super::Capability;
@@ -57,6 +58,11 @@ pub struct HttpAttackCapability {
     /// `None` → 不注 X-Veriguard-Sig / X-Veriguard-Timestamp（platform verifier
     /// 落 `unsigned` evidence，attribution 仍保留 strong/1.00；兼容旧栈）.
     attribution_signer: Option<Arc<AttributionSigner>>,
+    /// 可选 agent-local allowed-cidr 白名单 (招标 §3.5 / §6.1 硬约束).
+    /// `None` → 跳过 pre-flight，与 [`crate::attribution`] 同款 opt-in；
+    /// `Some(_)` → execute 前用 [`AllowedCidrPolicy::evaluate_url`] 拦 Denied,
+    /// 不发包直接返 `failed_result` —— 与 platform 端 PR #88 形成双层 defense in depth.
+    allowed_cidr_policy: Option<Arc<AllowedCidrPolicy>>,
 }
 
 impl HttpAttackCapability {
@@ -79,6 +85,7 @@ impl HttpAttackCapability {
         Self {
             client,
             attribution_signer: None,
+            allowed_cidr_policy: None,
         }
     }
 
@@ -89,6 +96,20 @@ impl HttpAttackCapability {
     /// platform verifier (`Veriguard` PR #83) 用预置公钥验签 → STRONG / 1.00.
     pub fn with_attribution_signer(mut self, signer: Arc<AttributionSigner>) -> Self {
         self.attribution_signer = Some(signer);
+        self
+    }
+
+    /// Attach an agent-local allowed-CIDR pre-flight policy (招标 §3.5 / §6.1
+    /// 硬约束 + 双层 defense in depth；C-2 路线图)。设置后，每次 [`Self::execute`]
+    /// 在 `client.request()` 前先用 [`AllowedCidrPolicy::evaluate_url`] 校验 payload.url：
+    ///
+    /// - `Denied` → 不发包直接返 `failed_result(..)` 含 reason
+    /// - `Allowed` / `Deferred` / `Malformed` → 透传放行 (reqwest 自然处理)
+    ///
+    /// `None` (默认) → 完全跳过校验，保持向后兼容；与 `with_attribution_signer`
+    /// 同款 opt-in 模式 (env var `VERIGUARD_TARGET_ALLOWED_CIDR` 未配则 `None`)。
+    pub fn with_allowed_cidr_policy(mut self, policy: Arc<AllowedCidrPolicy>) -> Self {
+        self.allowed_cidr_policy = Some(policy);
         self
     }
 }
@@ -126,6 +147,16 @@ impl Capability for HttpAttackCapability {
         };
 
         let started_at = rfc3339_now();
+
+        // 招标 §3.5 / §6.1 pre-flight 目标白名单校验（C-2 双层防御 agent 侧；
+        // policy 未配 → 跳过；hostname / 解析失败透传, reqwest 自然处理）。
+        if let Some(policy) = &self.allowed_cidr_policy {
+            if let CidrOutcome::Denied { reason } = policy.evaluate_url(&payload.url) {
+                return failed_result(format!(
+                    "pre-flight DENIED (招标 §3.5/§6.1 allowed-cidr): {reason}"
+                ));
+            }
+        }
 
         let method = match payload.method.parse::<reqwest::Method>() {
             Ok(m) => m,
@@ -547,8 +578,7 @@ mod tests {
             .with_status(200)
             .create();
 
-        let signer =
-            Arc::new(AttributionSigner::from_base64(&rfc8032_test1_seed_b64()).unwrap());
+        let signer = Arc::new(AttributionSigner::from_base64(&rfc8032_test1_seed_b64()).unwrap());
         let client = reqwest::blocking::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(5))
@@ -604,8 +634,7 @@ mod tests {
             .with_status(200)
             .create();
 
-        let signer =
-            Arc::new(AttributionSigner::from_base64(&rfc8032_test1_seed_b64()).unwrap());
+        let signer = Arc::new(AttributionSigner::from_base64(&rfc8032_test1_seed_b64()).unwrap());
         let client = reqwest::blocking::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(5))
@@ -624,4 +653,106 @@ mod tests {
         assert_eq!(result.status, "SUCCESS");
     }
 
+    // ---- C-2 allowed-cidr pre-flight (招标 §3.5 / §6.1 双层防御 agent 侧) ----
+
+    fn build_cap_with_cidr(cidr_csv: &str) -> HttpAttackCapability {
+        let policy =
+            Arc::new(AllowedCidrPolicy::from_csv(cidr_csv).expect("test CIDR fixture parses"));
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("client");
+        HttpAttackCapability::with_client(client).with_allowed_cidr_policy(policy)
+    }
+
+    #[test]
+    fn preflight_denied_url_blocks_send() {
+        // Whitelist 仅含 10.0.0.0/24 文档保留前缀; mockito 起在 127.0.0.1 → 不命中.
+        // 断言：mock.expect(0) 证实 capability **未发出 HTTP 请求**,
+        // result.status=FAILED 含 pre-flight DENIED reason.
+        let mut server = Server::new();
+        let m = server
+            .mock("GET", "/should-not-hit")
+            .with_status(200)
+            .expect(0)
+            .create();
+
+        let payload = serde_json::json!({
+            "method": "GET",
+            "url": format!("{}/should-not-hit", server.url()),
+            "expected_status_codes": [200],
+        });
+        let cap = build_cap_with_cidr("10.0.0.0/24");
+        let result = cap.execute(&task_with_payload(&payload.to_string()));
+
+        m.assert();
+        assert_eq!(result.status, "FAILED");
+        let msg = result.error_message.unwrap();
+        assert!(
+            msg.contains("pre-flight DENIED"),
+            "msg should signal pre-flight: {msg}"
+        );
+        assert!(
+            msg.contains("招标 §3.5/§6.1"),
+            "msg should cite spec section: {msg}"
+        );
+    }
+
+    #[test]
+    fn preflight_allowed_url_proceeds() {
+        // Whitelist 含 127.0.0.0/8 → mockito 的 127.0.0.1 端点命中, 请求正常发.
+        let mut server = Server::new();
+        let m = server.mock("GET", "/probe").with_status(200).create();
+
+        let payload = serde_json::json!({
+            "method": "GET",
+            "url": format!("{}/probe", server.url()),
+            "expected_status_codes": [200],
+        });
+        let cap = build_cap_with_cidr("127.0.0.0/8");
+        let result = cap.execute(&task_with_payload(&payload.to_string()));
+
+        m.assert();
+        assert_eq!(result.status, "SUCCESS");
+    }
+
+    #[test]
+    fn preflight_hostname_deferred_proceeds() {
+        // mockito server.url() 默认形如 http://127.0.0.1:PORT; 显式改用 localhost
+        // (hostname) → policy 返 Deferred → 透传, reqwest 自行解析后发包.
+        let mut server = Server::new();
+        let m = server.mock("GET", "/probe").with_status(200).create();
+        let url = server.url().replace("127.0.0.1", "localhost");
+
+        let payload = serde_json::json!({
+            "method": "GET",
+            "url": format!("{}/probe", url),
+            "expected_status_codes": [200],
+        });
+        // CIDR 故意不含 127.0.0.0/8 —— 验证 Deferred (hostname) 不被 Denied 卡.
+        let cap = build_cap_with_cidr("10.0.0.0/24");
+        let result = cap.execute(&task_with_payload(&payload.to_string()));
+
+        m.assert();
+        assert_eq!(result.status, "SUCCESS");
+    }
+
+    #[test]
+    fn preflight_no_policy_is_noop() {
+        // 默认 capability (policy=None) → 不做任何 pre-flight, 与未引入本特性的旧行为完全一致.
+        let mut server = Server::new();
+        let m = server.mock("GET", "/probe").with_status(200).create();
+
+        let payload = serde_json::json!({
+            "method": "GET",
+            "url": format!("{}/probe", server.url()),
+            "expected_status_codes": [200],
+        });
+        let cap = build_test_capability(); // 无 policy
+        let result = cap.execute(&task_with_payload(&payload.to_string()));
+
+        m.assert();
+        assert_eq!(result.status, "SUCCESS");
+    }
 }
