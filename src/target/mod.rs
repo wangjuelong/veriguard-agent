@@ -78,8 +78,8 @@ impl ParsedCidr {
         }
         let full_bytes = (self.prefix_len / BITS_PER_BYTE) as usize;
         let remaining_bits = self.prefix_len % BITS_PER_BYTE;
-        for i in 0..full_bytes {
-            if target[i] != self.network[i] {
+        for (t, n) in target.iter().zip(self.network.iter()).take(full_bytes) {
+            if t != n {
                 return false;
             }
         }
