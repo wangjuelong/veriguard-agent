@@ -39,9 +39,7 @@ use crate::crypto::ed25519::Ed25519PrivateKey;
 pub enum AttributionError {
     #[error("VERIGUARD_ATTRIBUTION_PRIV_KEY_B64 base64 解码失败: {0}")]
     BadBase64(String),
-    #[error(
-        "VERIGUARD_ATTRIBUTION_PRIV_KEY_B64 解码后长度 {got} ≠ {expected} (Ed25519 seed)"
-    )]
+    #[error("VERIGUARD_ATTRIBUTION_PRIV_KEY_B64 解码后长度 {got} ≠ {expected} (Ed25519 seed)")]
     BadKeyLength { got: usize, expected: usize },
 }
 
@@ -173,7 +171,10 @@ mod tests {
         let result = AttributionSigner::from_base64(&short);
         assert!(matches!(
             result,
-            Err(AttributionError::BadKeyLength { got: 16, expected: 32 })
+            Err(AttributionError::BadKeyLength {
+                got: 16,
+                expected: 32
+            })
         ));
     }
 }
