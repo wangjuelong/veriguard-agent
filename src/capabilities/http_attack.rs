@@ -70,10 +70,17 @@ impl HttpAttackCapability {
     pub const NAME: &'static str = "http_attack";
 
     /// Construct a capability with the default HTTP client and no attribution signer.
+    ///
+    /// 默认 TLS config 走 [`crate::attribution::tls::build_attribution_tls_config`]，
+    /// ClientHello 里 advertise 一个稳定的 `veriguard-attrib/1` ALPN marker
+    /// （招标 §3.3.4 第 5 L1 强归因通道，SOC 可 pcap/DPI 识别）。服务端按 RFC 7301
+    /// 仍只挑 h2 / http/1.1，握手语义不变。
     pub fn new() -> Self {
+        let tls_config = crate::attribution::tls::build_attribution_tls_config();
         Self::with_client(
             reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(30))
+                .use_preconfigured_tls((*tls_config).clone())
                 .build()
                 .expect("blocking client"),
         )
