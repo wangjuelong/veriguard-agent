@@ -7,6 +7,11 @@ license = "Apache-2.0"
 
 [dependencies]
 reqwest = { version = "0.12.15", features = ["blocking", "rustls-tls", "rustls-tls-native-roots", "json"], default-features = false }
+# Veriguard 二开 (招标 §3.3.4 第 5 通道 TLS L1 强归因): 直接构造 rustls::ClientConfig
+# 给 HttpAttackCapability 注入 ALPN marker; 版本同 reqwest 0.12.15 transitive (Cargo.lock 0.23.40 / 0.8.3).
+# 关 default-features 显式列 ring crypto + tls12 + std + logging, 与 reqwest 内部 rustls 选型一致避免 feature 冲突.
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12", "logging"] }
+rustls-native-certs = "0.8"
 config = "0.15.0"
 serde = { version = "1.0.203", features = ["derive"] }
 serde_json = {version = "1.0.140"}

@@ -34,6 +34,9 @@ use thiserror::Error;
 
 use crate::crypto::ed25519::Ed25519PrivateKey;
 
+/// TLS-layer L1 强归因 ALPN marker（招标 §3.3.4 第 5 通道）.
+pub mod tls;
+
 /// 私钥加载/解码失败.
 #[derive(Debug, Error)]
 pub enum AttributionError {
