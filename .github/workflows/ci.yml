@@ -1,0 +1,45 @@
+# Veriguard Agent — clippy gate CI
+#
+# 在 PR / push to main 时跑 `cargo clippy --all-targets -- -D warnings` —— 防 agent#11
+# (4 + 7 警告全清) 这种 cleanup 后被新代码 reintroduce 而合并溜入主分支。
+#
+# 与 `release.yml` (tag push 多平台 binary build) 互补 —— release 跑慢 + 全平台；
+# ci 跑快 + 单平台 (ubuntu) + 严格 lint，捕日常 PR 的回归。
+#
+# 后续可在本文件加 `test` / `fmt` job 把 cargo test + cargo fmt --check 也纳入。
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  clippy:
+    name: cargo clippy -D warnings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust + clippy
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-clippy-
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
